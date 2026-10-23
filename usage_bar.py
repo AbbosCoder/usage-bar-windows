@@ -959,10 +959,14 @@ def _used(g: dict | None) -> float | None:
     return max(vals) if vals else None
 
 
-def agy_quota_rows(refresh: bool = False) -> list[dict]:
-    """Per-account agy quota (% used) from the tray's cache; checks again whatever is due (or all with refresh)."""
+def agy_quota_rows(refresh: bool = False, max_age: float | None = None) -> list[dict]:
+    """Per-account agy quota (% used) from the tray's cache. Checks again: everything (refresh), only numbers older
+    than max_age seconds, or otherwise whatever is due on the normal schedule. Checking means running agy per account."""
     st = Store()
-    st.refresh(force=refresh, wait=True)
+    if refresh:
+        st.refresh(force=True, wait=True, agy_only=True)
+    else:
+        st.refresh(wait=True, agy_only=True, agy_max_age=max_age)
     st.load()
     active = AgyAccounts(st.config).active()
 
@@ -1061,7 +1065,8 @@ def cmd_run(args: list[str]) -> int:
               "(yoki config.json'da \"agyPath\" ni agy.exe ga yo'naltiring).")
         return 2
 
-    rows = agy_quota_rows(refresh)
+    started = time.time()
+    rows = agy_quota_rows(refresh, max_age=30 * 60)   # the tray keeps these fresh; a stale pick is fixed by the fallback
     usable = [r for r in rows if r["enabled"] and not r["needsLogin"]]
     if account:
         order = [r for r in usable if r["name"].lower() == account.lower()]
@@ -1101,7 +1106,9 @@ def cmd_run(args: list[str]) -> int:
             sys.stdout.flush()
             email = next((o["email"] for o in rows if o["name"] == name), None)
             print(f"[agy-acc] {name}" + (f" ({email})" if email else "") + " bilan bajarilmoqda…", file=sys.stderr, flush=True)
+            t0 = time.time()
             rc, tail = _run_streaming([agy, "-p", prompt])
+            print(f"[agy-acc] {time.time() - t0:.0f} s (agy) · jami {time.time() - started:.0f} s", file=sys.stderr, flush=True)
             if rc != 0 and EXHAUSTED_RX.search(tail):
                 print(f"\n[agy-acc] {name} limiti tugadi — keyingi akkauntga o'tyapman.", file=sys.stderr, flush=True)
                 if running:
@@ -1500,13 +1507,15 @@ class Store:
             return True
         return now >= (r.get("lastAttempt") or 0) + max(self.config["refreshMinutes"], 5) * 60   # never poll faster than 5 min
 
-    def _agy_due(self, a, force, now):
+    def _agy_due(self, a, force, now, max_age=None):
         r = self.cache["agy"].get(a["name"].lower())
         if not r or r.get("source") != a.get("home"):
             return True
+        if max_age is not None:   # callers that only need roughly current numbers
+            return now >= (r.get("fetchedAt") or 0) + max_age and now >= (r.get("lastAttempt") or 0) + 60
         return now >= (r.get("lastAttempt") or 0) + (30 if force else max(self.config["refreshMinutes"], 1) * 60)
 
-    def refresh(self, force=False, wait=False) -> None:
+    def refresh(self, force=False, wait=False, agy_only=False, agy_max_age=None) -> None:
         if (self.config.get("quotaFile") or "").strip():
             self.load()
             self.on_change()
@@ -1515,8 +1524,8 @@ class Store:
             if self.refreshing:
                 return
             now = time.time()
-            cj = [a for a in self.config["claude"] if self._claude_due(a, force, now)]
-            aj = [a for a in self.config["agy"] if a["enabled"] and self._agy_due(a, force, now)]
+            cj = [] if agy_only else [a for a in self.config["claude"] if self._claude_due(a, force, now)]
+            aj = [a for a in self.config["agy"] if a["enabled"] and self._agy_due(a, force and agy_max_age is None, now, agy_max_age)]
             if not cj and not aj:
                 self.load()
                 self.on_change()
