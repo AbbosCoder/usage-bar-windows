@@ -1,0 +1,1253 @@
+"""
+Usage — Windows tray app: Claude Code va agy (Google Antigravity CLI) limitlarini bir joyda ko'rsatadi.
+
+macOS'dagi "usage-bar" (Swift) dasturining Windows uchun Python porti.
+  * Tray ikonka: tashqi halqa + raqam = asosiy Claude akkauntining 5 soatlik limiti (% ishlatilgan).
+  * Chap tugma: popover oyna (Claude kartalari, agy qatorlari).  O'ng tugma: menyu.
+
+Ishga tushirish:   pythonw usage_bar.py
+Tekshirish:        python usage_bar.py --check
+agy akkaunt qo'sh: python usage_bar.py --add-agy [nomi]
+
+Hech qanday token diskka yoki logga yozilmaydi. Tarmoq: faqat api.anthropic.com (o'zingizning tokeningiz bilan).
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+
+IS_WIN = sys.platform == "win32"
+HOME = Path.home()
+APP_NAME = "UsageBar"
+USAGE_URL = os.environ.get("USAGE_BAR_API") or "https://api.anthropic.com/api/oauth/usage"
+AGY_ACCOUNTS_DIR = HOME / ".agy-accounts"
+CREATE_NO_WINDOW = 0x08000000
+CREATE_NEW_CONSOLE = 0x00000010
+
+
+def _config_path() -> Path:
+    p = os.environ.get("USAGE_BAR_CONFIG")
+    return Path(os.path.expanduser(p)) if p else HOME / ".config" / "usage-bar" / "config.json"
+
+
+def _cache_path() -> Path:
+    p = os.environ.get("USAGE_BAR_CACHE")
+    if p:
+        return Path(os.path.expanduser(p)) / "cache.json"
+    base = os.environ.get("LOCALAPPDATA") if IS_WIN else None
+    return (Path(base) if base else HOME / ".cache") / "usage-bar" / "cache.json"
+
+
+CONFIG_PATH = _config_path()
+CACHE_PATH = _cache_path()
+
+
+def expand(p: str) -> str:
+    return os.path.normpath(os.path.expandvars(os.path.expanduser(p)))
+
+
+def same_path(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.abspath(expand(a))) == os.path.normcase(os.path.abspath(expand(b)))
+
+
+# ───────────────────────────── config ─────────────────────────────
+
+def normalize_config(raw: dict) -> dict:
+    cfg = {
+        "refreshMinutes": int(raw.get("refreshMinutes") or 5),
+        "menuBarAccount": raw.get("menuBarAccount"),
+        "trayIcon": raw.get("trayIcon") or "number",
+        "agyPath": raw.get("agyPath"),
+        "claude": [],
+        "agy": [],
+        "quotaFile": raw.get("quotaFile"),
+    }
+    for c in raw.get("claude") or []:
+        if not isinstance(c, dict) or not c.get("name") or not c.get("configDir"):
+            raise ValueError('har bir "claude" yozuvida "name" va "configDir" bo\'lishi kerak')
+        cfg["claude"].append({"name": str(c["name"]), "label": c.get("label") or None, "configDir": str(c["configDir"])})
+    for a in raw.get("agy") or []:
+        if not isinstance(a, dict) or not a.get("name"):
+            raise ValueError('har bir "agy" yozuvida "name" bo\'lishi kerak')
+        cfg["agy"].append({"name": str(a["name"]), "home": a.get("home") or None,
+                           "enabled": a.get("enabled", True) is not False, "env": a.get("env") or None})
+    return cfg
+
+
+def load_config() -> tuple[dict, str | None]:
+    if not CONFIG_PATH.exists():
+        cfg = autodetect()
+        save_config(cfg)
+        return cfg, None
+    try:
+        return normalize_config(json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))), None
+    except Exception as e:  # a broken file is reported, never overwritten
+        return autodetect(), f"config.json xato: {e}"
+
+
+def save_config(cfg: dict) -> None:
+    out = {
+        "refreshMinutes": cfg["refreshMinutes"],
+        "menuBarAccount": cfg.get("menuBarAccount"),
+        "trayIcon": cfg.get("trayIcon", "number"),
+        "agyPath": cfg.get("agyPath"),
+        "claude": [{k: v for k, v in c.items() if v is not None} for c in cfg["claude"]],
+        "agy": [{k: v for k, v in a.items() if v is not None} for a in cfg["agy"]],
+        "quotaFile": cfg.get("quotaFile"),
+    }
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, CONFIG_PATH)
+
+
+def _looks_like_claude_dir(p: Path) -> bool:
+    return p.is_dir() and any((p / n).exists() for n in
+                              ["settings.json", ".credentials.json", "projects", "sessions", "statsig", "todos", "CLAUDE.md"])
+
+
+def autodetect() -> dict:
+    cfg = normalize_config({})
+    dirs = [HOME / ".claude"] if _looks_like_claude_dir(HOME / ".claude") else []
+    try:
+        dirs += sorted(p for p in HOME.iterdir() if p.name.startswith(".claude-") and _looks_like_claude_dir(p))
+    except OSError:
+        pass
+    used: set[str] = set()
+    for d in dirs:
+        name = "main" if d.name == ".claude" else d.name[len(".claude-"):].lower()
+        if not name or name in used:
+            name = f"claude{len(used) + 1}"
+        used.add(name)
+        cfg["claude"].append({"name": name, "label": None, "configDir": "~/" + d.name})
+    cfg["menuBarAccount"] = cfg["claude"][0]["name"] if cfg["claude"] else None
+
+    if find_agy(cfg):
+        cfg["agy"].append({"name": "agy", "home": None, "enabled": True, "env": None})
+    if AGY_ACCOUNTS_DIR.is_dir():
+        for d in sorted(p for p in AGY_ACCOUNTS_DIR.iterdir() if p.is_dir()):
+            cfg["agy"].append({"name": d.name, "home": "~/.agy-accounts/" + d.name, "enabled": True, "env": None})
+    return cfg
+
+
+# ───────────────────────────── finding binaries ─────────────────────────────
+
+def _extra_dirs() -> list[Path]:
+    dirs = [HOME / ".local" / "bin", HOME / ".bun" / "bin", HOME / ".antigravity" / "bin", HOME / ".claude" / "local"]
+    if IS_WIN:
+        for var, subs in (("APPDATA", ["npm"]),
+                          ("LOCALAPPDATA", ["Programs\\Antigravity\\bin", "Programs\\agy", "Programs\\antigravity",
+                                            "Microsoft\\WinGet\\Links", "Programs\\claude"])):
+            base = os.environ.get(var)
+            if base:
+                dirs += [Path(base) / s for s in subs]
+    else:
+        dirs += [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]
+    return dirs
+
+
+def find_binary(name: str) -> str | None:
+    hit = shutil.which(name)
+    if hit:
+        return hit
+    exts = [".exe", ".cmd", ".bat"] if IS_WIN else [""]
+    for d in _extra_dirs():
+        for e in exts:
+            p = d / (name + e)
+            if p.is_file():
+                return str(p)
+    return None
+
+
+def find_agy(cfg: dict) -> str | None:
+    p = cfg.get("agyPath")
+    if p and Path(expand(p)).is_file():
+        return expand(p)
+    return find_binary("agy")
+
+
+# ───────────────────────────── cache ─────────────────────────────
+
+def load_cache() -> dict:
+    try:
+        c = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        return {"claude": c.get("claude") or {}, "agy": c.get("agy") or {}}
+    except Exception:
+        return {"claude": {}, "agy": {}}
+
+
+def save_cache(cache: dict) -> None:
+    try:
+        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CACHE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache), encoding="utf-8")
+        os.replace(tmp, CACHE_PATH)
+    except OSError:
+        pass
+
+
+def parse_iso(s: str | None) -> float | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.strip().replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+# ───────────────────────────── Claude ─────────────────────────────
+
+def claude_token(acct: dict) -> tuple[str, str | None]:
+    """('ok', token) | ('expired', None) | ('missing', None). Claude Code on Windows keeps it in <configDir>/.credentials.json."""
+    f = Path(expand(acct["configDir"])) / ".credentials.json"
+    try:
+        j = json.loads(f.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return "missing", None
+    o = j.get("claudeAiOauth") or j
+    tok = o.get("accessToken")
+    if not tok:
+        return "missing", None
+    exp = o.get("expiresAt")
+    if isinstance(exp, (int, float)) and exp / 1000 < time.time():
+        return "expired", None
+    return "ok", tok
+
+
+def _window(d) -> dict | None:
+    if not isinstance(d, dict) or d.get("utilization") is None:
+        return None
+    return {"used": float(d["utilization"]), "resets": parse_iso(d.get("resets_at"))}
+
+
+def call_usage_api(token: str):
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "usage-bar-windows"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            j = json.loads(r.read().decode("utf-8"))
+            return "ok", (_window(j.get("five_hour")), _window(j.get("seven_day")))
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            ra = e.headers.get("Retry-After")
+            try:
+                return "rate", float(ra) if ra else None
+            except ValueError:
+                return "rate", None
+        if e.code in (401, 403):
+            return "unauth", None
+        return "fail", f"Usage API HTTP {e.code} qaytardi"
+    except Exception as e:
+        return "fail", f"Tarmoq xatosi: {getattr(e, 'reason', e)}"
+
+
+def fetch_claude(acct: dict, prior: dict | None) -> dict:
+    rec = dict(prior or {})
+    now = time.time()
+    rec["source"] = acct["configDir"]
+    rec["lastAttempt"] = now
+    state, tok = claude_token(acct)
+    if state == "missing":
+        rec["error"] = "Claude login topilmadi. Menyu → Claude akkauntlar → Kirish."
+        return rec
+    if state == "expired":
+        rec["error"] = "Claude tokeni eskirgan. Shu akkauntda Claude Code'ni bir marta oching."
+        return rec
+    rec["lastAPICall"] = now
+    kind, val = call_usage_api(tok)
+    if kind == "ok":
+        rec["five"], rec["week"] = val
+        rec.update(fetchedAt=now, error=None, backoffUntil=None, backoffSecs=None)
+    elif kind == "rate":
+        secs = min(val, 6 * 3600) if val and val > 0 else min((rec.get("backoffSecs") or 450) * 2, 3600)
+        rec.update(backoffSecs=secs, backoffUntil=now + secs, error="Anthropic limit (429). Oxirgi ma'lum raqamlar ko'rsatilmoqda.")
+    elif kind == "unauth":
+        rec["error"] = "Claude tokeni rad etildi. Shu akkauntda Claude Code'ga qayta kiring."
+    else:
+        rec["error"] = val
+    return rec
+
+
+# ───────────────────────────── agy ─────────────────────────────
+
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
+PCT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+ISO = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?")
+
+
+def parse_agy(text: str) -> tuple[dict | None, dict | None]:
+    """Rows look like `Group<TAB>Label<TAB>NN%<TAB>ISO-UTC` (NN = REMAINING %). Also accepts space/box-drawn tables.
+    Returns (gemini, claude_gpt) groups as {"week": win, "five": win} with % USED."""
+    groups = {"gemini": {}, "claude": {}}
+    for line in ANSI.sub("", text).splitlines():
+        cols = [c.strip() for c in re.split(r"\t|\s{2,}|[│|]", line) if c.strip()]
+        if len(cols) < 3:
+            continue
+        head = (cols[0] + " " + cols[1]).lower()
+        if "gemini" in head:
+            g = "gemini"
+        elif "claude" in head or "gpt" in head:
+            g = "claude"
+        else:
+            continue
+        m = PCT.search(" ".join(cols[1:]))
+        if not m:
+            continue
+        label = " ".join(c for c in cols[:3] if "%" not in c and not ISO.search(c)).lower()
+        if re.search(r"week|7[- ]?day", label):
+            win = "week"
+        elif re.search(r"five|5[- ]?h|5[- ]?hour|5[- ]?soat", label):
+            win = "five"
+        else:
+            continue
+        iso = ISO.search(line)
+        rem = float(m.group(1))
+        groups[g][win] = {"used": min(max(100 - rem, 0), 100), "resets": parse_iso(iso.group(0)) if iso else None}
+    return groups["gemini"] or None, groups["claude"] or None
+
+
+def agy_env(acct: dict) -> dict:
+    env = dict(os.environ)
+    home = acct.get("home")
+    if home and not same_path(home, str(HOME)):
+        h = expand(home)
+        Path(h).mkdir(parents=True, exist_ok=True)
+        env["HOME"] = h
+        if IS_WIN:
+            env["USERPROFILE"] = h   # Node/Go read the home folder from USERPROFILE on Windows
+    for k, v in (acct.get("env") or {}).items():
+        env[str(k)] = expand(str(v))
+    return env
+
+
+def run_capture(args: list[str], env: dict, timeout: float) -> tuple[str, bool, str | None]:
+    """(merged output, timed_out, launch_error). No console window flashes on Windows."""
+    kw = {}
+    if IS_WIN:
+        kw["creationflags"] = CREATE_NO_WINDOW
+    try:
+        p = subprocess.Popen(args, env=env, cwd=tempfile.gettempdir(), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kw)
+    except OSError as e:
+        return "", False, str(e)
+    try:
+        out, _ = p.communicate(timeout=timeout)
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        if IS_WIN:   # .cmd shims start grandchildren: kill the whole tree
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True, creationflags=CREATE_NO_WINDOW)
+        else:
+            p.kill()
+        try:
+            out, _ = p.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            out = b""
+    return (out or b"").decode("utf-8", errors="replace"), timed_out, None
+
+
+def fetch_agy(acct: dict, prior: dict | None, agy_bin: str | None) -> dict:
+    rec = dict(prior or {})
+    rec["source"] = acct.get("home")
+    rec["lastAttempt"] = time.time()
+    if not agy_bin:
+        rec["error"] = "agy topilmadi. O'rnating yoki config.json'da \"agyPath\" ni yozing."
+        return rec
+    out, timed_out, err = run_capture([agy_bin, "-p", "/quota"], agy_env(acct), timeout=90)
+    if err:
+        rec["error"] = err
+        return rec
+    gem, cla = parse_agy(out)
+    if gem or cla:
+        rec.update(gemini=gem, claude=cla, fetchedAt=rec["lastAttempt"], needsLogin=False, error=None)
+        return rec
+    low = out.lower()
+    if any(k in low for k in ("authentication", "not signed in", "sign in", "not logged in", "log in", "login")):
+        rec.update(needsLogin=True, error=None)
+    elif timed_out:
+        rec["error"] = "agy /quota javob bermadi (timeout)"
+    else:
+        tail = out.strip()
+        rec["error"] = tail[-200:] if tail else "agy kvota ma'lumotini qaytarmadi"
+    return rec
+
+
+# ───────────────────────────── quotaFile (optional) ─────────────────────────────
+
+def read_quota_file(path: str) -> dict | None:
+    try:
+        j = json.loads(Path(expand(path)).read_text(encoding="utf-8-sig"))
+    except Exception:
+        return None
+
+    def win(d, remaining):
+        if not isinstance(d, dict):
+            return None
+        v = d.get("remaining" if remaining else "pct")
+        return None if v is None else {"used": 100 - v if remaining else v, "resets": d.get("resets")}
+
+    def grp(d):
+        return {"week": win(d.get("week"), True), "five": win(d.get("five"), True)} if isinstance(d, dict) else None
+
+    ts = j.get("ts")
+    out = {"ts": ts, "claude": {}, "agy": {}}
+    for k, q in (j.get("claude") or {}).items():
+        out["claude"][k.lower()] = {"five": win(q.get("five_hour"), False), "week": win(q.get("seven_day"), False),
+                                    "fetchedAt": q.get("ts", ts), "error": q.get("error")}
+    for k, q in (j.get("agy") or {}).items():
+        out["agy"][k.lower()] = {"gemini": grp(q.get("gemini")), "claude": grp(q.get("claude")), "fetchedAt": q.get("ts", ts),
+                                 "needsLogin": bool(q.get("needs_login")), "error": q.get("error")}
+    return out
+
+
+# ───────────────────────────── store ─────────────────────────────
+
+def severity(p: float) -> int:
+    return 0 if p < 70 else 1 if p < 85 else 2 if p < 95 else 3
+
+
+class Store:
+    """Fetches Claude + agy limits (or reads quotaFile) and builds the view model. Thread-safe."""
+
+    def __init__(self, on_change=lambda: None):
+        self.on_change = on_change
+        self.lock = threading.RLock()
+        self.cache = load_cache()
+        self.config, self.problem = load_config()
+        self.refreshing = False
+        self.view: dict = {}
+        self.load()
+
+    # derived view model (no network)
+    def load(self) -> None:
+        now = time.time()
+        cfg = self.config
+        with self.lock:
+            crecs, arecs = dict(self.cache["claude"]), dict(self.cache["agy"])
+        names = [c["name"] for c in cfg["claude"]]
+        updated = None
+        problem = self.problem
+        qf = (cfg.get("quotaFile") or "").strip()
+        if qf:
+            r = read_quota_file(qf)
+            if r:
+                crecs, arecs, updated = r["claude"], r["agy"], r["ts"]
+                known = {n.lower() for n in names}
+                names += sorted(k for k in r["claude"] if k not in known)
+            else:
+                problem = problem or f"quotaFile o'qilmadi: {os.path.basename(qf)}"
+        else:
+            stamps = [crecs.get(c["name"].lower(), {}).get("fetchedAt") for c in cfg["claude"]]
+            stamps += [arecs.get(a["name"].lower(), {}).get("fetchedAt") for a in cfg["agy"] if a["enabled"]]
+            stamps = [s for s in stamps if s]
+            updated = max(stamps) if stamps else None
+
+        def live(w):
+            if not w:
+                return None
+            if w.get("resets") and w["resets"] < now:
+                return {"used": 0.0, "resets": None}
+            return {"used": float(w["used"]), "resets": w.get("resets")}
+
+        def grp(g):
+            return {"week": live(g.get("week")), "five": live(g.get("five"))} if g else None
+
+        claude = []
+        for n in names:
+            rec = crecs.get(n.lower()) or {}
+            label = next((c.get("label") for c in cfg["claude"] if c["name"] == n), None)
+            claude.append({"id": n, "name": n.upper(), "label": label, "quiet": (label or "").lower() == "reserve",
+                           "five": live(rec.get("five")), "week": live(rec.get("week")), "error": rec.get("error"),
+                           "stale": bool(rec.get("error") and rec.get("five"))})
+        agy = []
+        for a in cfg["agy"]:
+            rec = arecs.get(a["name"].lower()) or {}
+            agy.append({"id": a["name"], "enabled": a["enabled"], "needsLogin": bool(rec.get("needsLogin")),
+                        "gemini": grp(rec.get("gemini")), "claude": grp(rec.get("claude")), "error": rec.get("error"),
+                        "fetched": bool(rec.get("fetchedAt"))})
+
+        mb = next((c for c in claude if c["id"].lower() == (cfg.get("menuBarAccount") or "").lower()), claude[0] if claude else None)
+        stale = updated is None or now - updated > 15 * 60
+        attention = stale or any(a["enabled"] and a["needsLogin"] for a in agy) or \
+            any(c["error"] and (c["five"] is None or c["stale"]) for c in claude)
+        alert = problem
+        if not alert:
+            hits = []
+            for c in claude:
+                for lbl, w in (("5 soat", c["five"]), ("hafta", c["week"])):
+                    if w and w["used"] >= 85:
+                        hits.append((w["used"], f"{c['name']} {lbl}: {round(w['used'])}%"
+                                     + (f" — {fmt_reset_short(w['resets'])} da tiklanadi" if w["resets"] else "")))
+            if hits:
+                alert = max(hits)[1]
+        if mb:
+            menu_name, five, week = mb["name"], mb["five"] and mb["five"]["used"], mb["week"] and mb["week"]["used"]
+        else:   # no Claude account: the tray shows the busiest agy account instead
+            def worst(key):
+                vals = [g[key]["used"] for a in agy if a["enabled"] for g in (a["gemini"], a["claude"]) if g and g.get(key)]
+                return max(vals) if vals else None
+            menu_name, five, week = ("AGY" if agy else None), worst("five"), worst("week")
+        self.view = {"claude": claude, "agy": agy, "updated": updated, "alert": alert, "attention": attention,
+                     "menu_name": menu_name, "five": five, "week": week,
+                     "worst": max([w["used"] for c in claude for w in (c["five"], c["week"]) if w] or [0])}
+
+    # refreshing
+    def _claude_due(self, a, force, now):
+        r = self.cache["claude"].get(a["name"].lower())
+        if not r or r.get("source") != a["configDir"]:
+            return True
+        if (r.get("backoffUntil") or 0) > now:
+            return False
+        if force and not r.get("lastAPICall"):
+            return True
+        return now >= (r.get("lastAttempt") or 0) + max(self.config["refreshMinutes"], 5) * 60   # never poll faster than 5 min
+
+    def _agy_due(self, a, force, now):
+        r = self.cache["agy"].get(a["name"].lower())
+        if not r or r.get("source") != a.get("home"):
+            return True
+        return now >= (r.get("lastAttempt") or 0) + (30 if force else max(self.config["refreshMinutes"], 1) * 60)
+
+    def refresh(self, force=False, wait=False) -> None:
+        if (self.config.get("quotaFile") or "").strip():
+            self.load()
+            self.on_change()
+            return
+        with self.lock:
+            if self.refreshing:
+                return
+            now = time.time()
+            cj = [a for a in self.config["claude"] if self._claude_due(a, force, now)]
+            aj = [a for a in self.config["agy"] if a["enabled"] and self._agy_due(a, force, now)]
+            if not cj and not aj:
+                self.load()
+                self.on_change()
+                return
+            self.refreshing = True
+            prior_c, prior_a = dict(self.cache["claude"]), dict(self.cache["agy"])
+        self.on_change()
+        agy_bin = find_agy(self.config)
+
+        def work():
+            try:
+                with ThreadPoolExecutor(max_workers=6) as ex:
+                    fc = {a["name"].lower(): ex.submit(fetch_claude, a, prior_c.get(a["name"].lower())) for a in cj}
+                    fa = {a["name"].lower(): ex.submit(fetch_agy, a, prior_a.get(a["name"].lower()), agy_bin) for a in aj}
+                    res_c = {k: f.result() for k, f in fc.items()}
+                    res_a = {k: f.result() for k, f in fa.items()}
+                with self.lock:
+                    self.cache["claude"].update(res_c)
+                    self.cache["agy"].update(res_a)
+                    save_cache(self.cache)
+            finally:
+                with self.lock:
+                    self.refreshing = False
+                self.load()
+                self.on_change()
+
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        if wait:
+            t.join()
+
+    # config actions
+    def reload_config(self):
+        self.config, self.problem = load_config()
+        self.load()
+        self.refresh(force=True)
+
+    def set_agy_enabled(self, name, on):
+        for a in self.config["agy"]:
+            if a["name"] == name:
+                a["enabled"] = on
+        save_config(self.config)
+        self.load()
+        if on:
+            self.refresh()
+        self.on_change()
+
+    def add_agy_account(self, name: str | None = None) -> dict:
+        taken = {a["name"].lower() for a in self.config["agy"]}
+        if not name:
+            i = 2
+            while f"agy{i}" in taken:
+                i += 1
+            name = f"agy{i}"
+        if name.lower() in taken:
+            return next(a for a in self.config["agy"] if a["name"].lower() == name.lower())
+        home = AGY_ACCOUNTS_DIR / name
+        home.mkdir(parents=True, exist_ok=True)
+        acct = {"name": name, "home": "~/.agy-accounts/" + name, "enabled": True, "env": None}
+        self.config["agy"].append(acct)
+        save_config(self.config)
+        self.load()
+        return acct
+
+    def sign_in_agy(self, name):
+        a = next((a for a in self.config["agy"] if a["name"] == name), None)
+        if a:
+            open_console([find_agy(self.config) or "agy"], agy_env(a), f"agy — {name}: Google akkaunt bilan kiring, keyin /quit")
+
+    def start_claude(self, name):
+        a = next((a for a in self.config["claude"] if a["name"] == name), None)
+        if not a:
+            return
+        env = dict(os.environ)
+        if not same_path(a["configDir"], "~/.claude"):
+            env["CLAUDE_CONFIG_DIR"] = expand(a["configDir"])
+        open_console([find_binary("claude") or "claude"], env, f"claude — {name}")
+
+
+def open_console(cmd: list[str], env: dict, title: str) -> None:
+    """Opens a new console window running cmd (for sign-in), with the given environment."""
+    if IS_WIN:
+        line = subprocess.list2cmdline(cmd)
+        safe = re.sub(r'[&|<>^"%]', " ", title)
+        # cmd /k "...": cmd strips the outer quotes, so the inner quoted exe path survives
+        subprocess.Popen(f'cmd.exe /k "title {safe} & {line}"', env=env, cwd=env.get("USERPROFILE", str(HOME)),
+                         creationflags=CREATE_NEW_CONSOLE)
+    else:
+        print(f"[{title}] run:", " ".join(cmd))
+
+
+# ───────────────────────────── formatting ─────────────────────────────
+
+WEEKDAYS = ["Du", "Se", "Ch", "Pa", "Ju", "Sh", "Ya"]
+
+
+def _wd(ts: float) -> str:
+    d = datetime.fromtimestamp(ts)
+    return f"{WEEKDAYS[d.weekday()]} {d:%H:%M}"
+
+
+def fmt_reset(ts: float | None) -> str:
+    if not ts:
+        return "—"
+    s = ts - time.time()
+    if s <= 0:
+        return "—"
+    if s < 20 * 3600:
+        h, m = int(s) // 3600, (int(s) % 3600 + 59) // 60
+        if m == 60:
+            h, m = h + 1, 0
+        return f"{m}m" if h == 0 else f"{h}h {m:02d}m"
+    return _wd(ts)
+
+
+def fmt_reset_short(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%H:%M") if ts - time.time() < 20 * 3600 else _wd(ts)
+
+
+def fmt_ago(ts: float | None) -> str:
+    if not ts:
+        return "ma'lumot yo'q"
+    s = int(time.time() - ts)
+    if s < 5:
+        return "hozirgina yangilandi"
+    if s < 60:
+        return f"{s} s oldin"
+    if s < 3600:
+        return f"{s // 60} daq oldin"
+    return f"{s // 3600} soat oldin"
+
+
+def pct(w) -> str:
+    return f"{round(w['used'])}%" if w else "–"
+
+
+# ───────────────────────────── drawing (Pillow) ─────────────────────────────
+
+STOPS = [((0x22, 0xD3, 0xEE), (0x34, 0xD3, 0x99)),   # calm: cyan → emerald
+         ((0xFD, 0xE0, 0x47), (0xF5, 0x9E, 0x0B)),   # amber
+         ((0xFD, 0xBA, 0x74), (0xF9, 0x73, 0x16)),   # orange
+         ((0xFC, 0xA5, 0xA5), (0xEF, 0x44, 0x44))]   # red
+SEV_TEXT = ["#34D399", "#FBBF24", "#FB923C", "#F87171"]
+ORANGE = (0xFB, 0x92, 0x3C)
+
+
+def _mix(a, b, t):
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def _font(size: int, bold=True):
+    from PIL import ImageFont
+    names = (["segoeuib.ttf", "arialbd.ttf"] if bold else ["segoeui.ttf", "arial.ttf"]) + ["DejaVuSans-Bold.ttf", "DejaVuSans.ttf"]
+    for n in names:
+        for base in ([os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")] if IS_WIN else []) + ["", "/usr/share/fonts/truetype/dejavu"]:
+            try:
+                return ImageFont.truetype(os.path.join(base, n) if base else n, size)
+            except OSError:
+                continue
+    return ImageFont.load_default(size)
+
+
+def taskbar_is_light() -> bool:
+    if not IS_WIN:
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            return winreg.QueryValueEx(k, "SystemUsesLightTheme")[0] == 1
+    except OSError:
+        return False
+
+
+def _arc(draw, box, frac, width, sev, n=72):
+    """Gradient arc from 12 o'clock, clockwise."""
+    if frac <= 0.005:
+        return
+    a, b = STOPS[sev]
+    steps = max(2, int(n * frac))
+    span = 360 * frac
+    for i in range(steps):
+        s = -90 + span * i / steps
+        e = -90 + span * (i + 1) / steps + 0.8
+        draw.arc(box, s, min(e, -90 + span), fill=_mix(a, b, i / (steps - 1)), width=width)
+
+
+def make_tray_icon(five, week, attention, style="number", light=False):
+    from PIL import Image, ImageDraw
+    S = 256
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    fg = (20, 20, 24) if light else (240, 240, 245)
+    track = (0, 0, 0, 55) if light else (255, 255, 255, 60)
+    if style == "rings":
+        for box, w, p in (((14, 14, S - 14, S - 14), 34, five), ((70, 70, S - 70, S - 70), 34, week)):
+            d.ellipse(box, outline=track, width=w)
+            if p is not None:
+                _arc(d, box, min(max(p / 100, 0), 1), w, severity(p))
+    else:
+        box, w = (8, 8, S - 8, S - 8), 30
+        d.ellipse(box, outline=track, width=w)
+        if five is not None:
+            _arc(d, box, min(max(five / 100, 0), 1), w, severity(five))
+        txt = "–" if five is None else str(min(round(five), 100))
+        f = _font(136 if len(txt) <= 2 else 96)
+        d.text((S / 2, S / 2 + 4), txt, font=f, fill=fg, anchor="mm")
+    if attention:
+        d.ellipse((S - 92, 0, S, 92), fill=(0, 0, 0, 0))
+        d.ellipse((S - 80, 8, S - 8, 80), fill=ORANGE)
+    return img.resize((64, 64), Image.LANCZOS)
+
+
+def make_bar(width, height, p, quiet=False, light=False):
+    from PIL import Image, ImageDraw
+    k = 4
+    W, H = width * k, height * k
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((0, 0, W - 1, H - 1), radius=H // 2, fill=(255, 255, 255, 22))
+    if p is not None and p > 0.5:
+        fw = max(H, int(W * min(p, 100) / 100))
+        a, b = STOPS[severity(p)]
+        grad = Image.new("RGBA", (fw, H))
+        gd = ImageDraw.Draw(grad)
+        for x in range(fw):
+            gd.line([(x, 0), (x, H)], fill=_mix(a, b, x / max(fw - 1, 1)) + (150 if quiet else 255,))
+        mask = Image.new("L", (fw, H), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, fw - 1, H - 1), radius=H // 2, fill=255)
+        img.paste(grad, (0, 0), mask)
+    return img.resize((width, height), Image.LANCZOS)
+
+
+# ───────────────────────────── Windows helpers ─────────────────────────────
+
+def work_area():
+    """(left, top, right, bottom) of the primary monitor minus the taskbar, in physical pixels."""
+    if IS_WIN:
+        import ctypes
+        from ctypes import wintypes
+        r = wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0):
+            return r.left, r.top, r.right, r.bottom
+    return None
+
+
+def single_instance() -> bool:
+    if not IS_WIN:
+        return True
+    import ctypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    single_instance._h = k32.CreateMutexW(None, False, "Local\\UsageBarWindowsSingleton")
+    return ctypes.get_last_error() != 183   # ERROR_ALREADY_EXISTS
+
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def _launch_command() -> str:
+    exe = sys.executable
+    if exe.lower().endswith("python.exe"):
+        w = exe[:-len("python.exe")] + "pythonw.exe"
+        if os.path.exists(w):
+            exe = w
+    return f'"{exe}" "{os.path.abspath(__file__)}"'
+
+
+def launch_at_login() -> bool:
+    if not IS_WIN:
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            return bool(winreg.QueryValueEx(k, APP_NAME)[0])
+    except OSError:
+        return False
+
+
+def set_launch_at_login(on: bool) -> None:
+    if not IS_WIN:
+        return
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if on:
+            winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, _launch_command())
+        else:
+            try:
+                winreg.DeleteValue(k, APP_NAME)
+            except OSError:
+                pass
+
+
+def open_in_editor(path: Path) -> None:
+    if IS_WIN:
+        subprocess.Popen(["notepad.exe", str(path)])
+    else:
+        print("config:", path)
+
+
+# ───────────────────────────── UI (tkinter popover + pystray) ─────────────────────────────
+
+BG = "#0B0C10"
+CARD = "#15161B"
+CARD_QUIET = "#111216"
+BORDER = "#23252C"
+FG = "#F2F2F5"
+FG2 = "#8B8D98"
+ACCENT = "#A5B4FC"
+ALERT_BG = "#3A2414"
+FONT = "Segoe UI" if IS_WIN else "DejaVu Sans"
+
+
+class App:
+    WIDTH = 360
+
+    def __init__(self, show=False):
+        import queue
+        import tkinter as tk
+        if IS_WIN:
+            try:
+                import ctypes
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            except Exception:
+                pass
+        self.tk = tk
+        self.q = queue.Queue()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.scale = self.root.winfo_fpixels("1i") / 96.0
+        self.images = []
+        self.expanded: set[str] = set()
+        self.menu_open = False
+        self.last_icon_key = None
+        self.store = Store(on_change=lambda: self.q.put(("changed",)))
+        self.win = None
+        self.icon = None
+        self._build_window()
+        self._start_tray()
+        self.store.refresh()
+        self.root.after(100, self._poll)
+        self.root.after(10_000, self._tick10)
+        self.root.after(60_000, self._tick60)
+        if show:
+            self.root.after(500, self.show)
+
+    def S(self, v):
+        return int(round(v * self.scale))
+
+    # tray (runs in its own thread; talks to tk only through the queue)
+    def _start_tray(self):
+        try:
+            import pystray
+        except Exception as e:
+            print("pystray ishlamadi:", e)
+            return
+        M = pystray.MenuItem
+        menu = pystray.Menu(
+            M("Ko'rsatish", lambda: self.q.put(("toggle",)), default=True),
+            M("Hozir yangilash", lambda: self.q.put(("refresh",))),
+            M("agy akkaunt qo'shish…", lambda: self.q.put(("add_agy",))),
+            M("Sozlamalarni ochish", lambda: self.q.put(("open_config",))),
+            M("Sozlamalarni qayta yuklash", lambda: self.q.put(("reload",))),
+            pystray.Menu.SEPARATOR,
+            M("Chiqish", lambda: self.q.put(("quit",))),
+        )
+        self.icon = pystray.Icon(APP_NAME, self._icon_image(), "Usage", menu)
+        self.icon.run_detached()
+
+    def _icon_image(self):
+        v = self.store.view
+        return make_tray_icon(v.get("five"), v.get("week"), v.get("attention"), self.store.config.get("trayIcon", "number"),
+                              taskbar_is_light())
+
+    def _update_tray(self):
+        if not self.icon:
+            return
+        v = self.store.view
+        key = (v.get("five") and round(v["five"]), v.get("week") and round(v["week"]), v.get("attention"),
+               self.store.config.get("trayIcon"), taskbar_is_light())
+        if key != self.last_icon_key:
+            self.last_icon_key = key
+            self.icon.icon = self._icon_image()
+        tip = "Usage"
+        if v.get("menu_name"):
+            tip = f"{v['menu_name']}: 5 soat {pct({'used': v['five']}) if v.get('five') is not None else '–'}" \
+                  f" · hafta {pct({'used': v['week']}) if v.get('week') is not None else '–'}"
+        self.icon.title = tip[:120]
+
+    # event loop glue
+    def _poll(self):
+        import queue
+        try:
+            while True:
+                msg = self.q.get_nowait()
+                self._handle(msg)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll)
+
+    def _handle(self, msg):
+        kind = msg[0]
+        if kind == "changed":
+            self._update_tray()
+            if self.visible():
+                self.render()
+        elif kind == "toggle":
+            self.hide() if self.visible() else self.show()
+        elif kind == "refresh":
+            self.store.refresh(force=True)
+        elif kind == "add_agy":
+            self.add_agy()
+        elif kind == "open_config":
+            open_in_editor(CONFIG_PATH)
+        elif kind == "reload":
+            self.store.reload_config()
+        elif kind == "quit":
+            self.quit()
+
+    def _tick10(self):
+        self.store.load()
+        self._update_tray()
+        if self.visible():
+            self.render()
+        self.root.after(10_000, self._tick10)
+
+    def _tick60(self):
+        self.store.refresh()   # every account has its own minimum interval
+        self.root.after(60_000, self._tick60)
+
+    # popover window
+    def _build_window(self):
+        tk = self.tk
+        w = tk.Toplevel(self.root)
+        w.withdraw()
+        w.overrideredirect(True)
+        w.attributes("-topmost", True)
+        w.configure(bg=BORDER)
+        w.bind("<Escape>", lambda e: self.hide())
+        w.bind("<FocusOut>", self._focus_out)
+        self.win = w
+        self.frame = tk.Frame(w, bg=BG, padx=self.S(14), pady=self.S(12))
+        self.frame.pack(fill="both", expand=True, padx=1, pady=1)
+        if IS_WIN:
+            w.update_idletasks()
+            try:   # Windows 11 rounded corners
+                import ctypes
+                hwnd = ctypes.windll.user32.GetParent(w.winfo_id())
+                pref = ctypes.c_int(2)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(pref), ctypes.sizeof(pref))
+            except Exception:
+                pass
+
+    def visible(self):
+        return self.win is not None and self.win.winfo_viewable()
+
+    def _focus_out(self, _e):
+        def check():
+            if not self.menu_open and self.visible() and self.win.focus_get() is None:
+                self.hide()
+        self.root.after(150, check)
+
+    def show(self):
+        self.store.load()
+        upd = self.store.view.get("updated")
+        if not upd or time.time() - upd > 120:
+            self.store.refresh()
+        self.render()
+        self.win.deiconify()
+        self.win.lift()
+        self.win.focus_force()
+
+    def hide(self):
+        self.win.withdraw()
+
+    def _place(self):
+        self.win.update_idletasks()
+        w, h = self.S(self.WIDTH), self.win.winfo_reqheight()
+        wa = work_area()
+        if wa:
+            _, t, r, b = wa
+        else:
+            _, t, r, b = 0, 0, self.win.winfo_screenwidth(), self.win.winfo_screenheight() - self.S(48)
+        h = min(h, b - t - self.S(24))
+        self.win.geometry(f"{w}x{h}+{r - w - self.S(12)}+{b - h - self.S(12)}")
+
+    # rendering
+    def _img(self, pil):
+        import base64
+        import io
+        buf = io.BytesIO()
+        pil.save(buf, "PNG")
+        im = self.tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
+        self.images.append(im)
+        return im
+
+    def render(self):
+        tk = self.tk
+        for c in self.frame.winfo_children():
+            c.destroy()
+        self.images = []
+        v = self.store.view
+        f = self.frame
+
+        head = tk.Frame(f, bg=BG)
+        head.pack(fill="x")
+        tk.Label(head, text="Usage", bg=BG, fg=FG, font=(FONT, 13, "bold")).pack(side="left")
+        btn = tk.Label(head, text="⟳", bg=BG, fg=ACCENT if not self.store.refreshing else FG2, font=(FONT, 13), cursor="hand2")
+        btn.pack(side="right")
+        btn.bind("<Button-1>", lambda e: self.store.refresh(force=True))
+        status = "yangilanmoqda…" if self.store.refreshing else fmt_ago(v.get("updated"))
+        tk.Label(head, text=status, bg=BG, fg=FG2, font=(FONT, 8)).pack(side="right", padx=self.S(8))
+
+        if v.get("alert"):
+            a = tk.Label(f, text="⚠  " + v["alert"], bg=ALERT_BG, fg="#FDBA74", font=(FONT, 9), anchor="w", justify="left",
+                         wraplength=self.S(self.WIDTH - 50), padx=self.S(10), pady=self.S(6))
+            a.pack(fill="x", pady=(self.S(10), 0))
+
+        if v["claude"]:
+            self._section("CLAUDE")
+            for c in v["claude"]:
+                self._claude_card(c)
+        if v["agy"]:
+            self._section("AGY · GEMINI")
+            for a in v["agy"]:
+                self._agy_card(a)
+        if not v["claude"] and not v["agy"]:
+            tk.Label(f, text="Akkaunt topilmadi. … → Sozlamalarni ochish", bg=BG, fg=FG2, font=(FONT, 9)).pack(pady=self.S(16))
+
+        foot = tk.Frame(f, bg=BG)
+        foot.pack(fill="x", pady=(self.S(10), 0))
+        more = tk.Label(foot, text="  •••  ", bg=CARD, fg=FG, font=(FONT, 10, "bold"), cursor="hand2")
+        more.pack(side="right")
+        more.bind("<Button-1>", lambda e: self._menu(e))
+        tk.Label(foot, text=f"{len(v['claude'])} Claude · {len([a for a in v['agy'] if a['enabled']])} agy",
+                 bg=BG, fg=FG2, font=(FONT, 8)).pack(side="left")
+        self._place()
+
+    def _section(self, title):
+        self.tk.Label(self.frame, text=title, bg=BG, fg=FG2, font=(FONT, 8, "bold"), anchor="w").pack(
+            fill="x", pady=(self.S(12), self.S(4)))
+
+    def _card(self, quiet=False):
+        tk = self.tk
+        outer = tk.Frame(self.frame, bg=BORDER)
+        outer.pack(fill="x", pady=(0, self.S(6)))
+        inner = tk.Frame(outer, bg=CARD_QUIET if quiet else CARD, padx=self.S(10), pady=self.S(8))
+        inner.pack(fill="x", padx=1, pady=1)
+        return inner
+
+    def _bar_row(self, parent, label, w, quiet=False, bg=CARD):
+        tk = self.tk
+        row = tk.Frame(parent, bg=bg)
+        row.pack(fill="x", pady=(self.S(3), 0))
+        tk.Label(row, text=label, bg=bg, fg=FG2, font=(FONT, 9), width=7, anchor="w").pack(side="left")
+        bar = self._img(make_bar(self.S(130), self.S(6), w["used"] if w else None, quiet))
+        tk.Label(row, image=bar, bg=bg, bd=0).pack(side="left", padx=(0, self.S(8)))
+        tk.Label(row, text=fmt_reset(w["resets"]) if w else "", bg=bg, fg=FG2, font=(FONT, 8), width=9, anchor="e").pack(side="right")
+        color = FG2 if not w else (FG if quiet else SEV_TEXT[severity(w["used"])] if w["used"] >= 70 else FG)
+        tk.Label(row, text=pct(w), bg=bg, fg=color, font=(FONT, 9, "bold"), width=4, anchor="e").pack(side="right")
+
+    def _claude_card(self, c):
+        tk = self.tk
+        bg = CARD_QUIET if c["quiet"] else CARD
+        card = self._card(c["quiet"])
+        top = tk.Frame(card, bg=bg)
+        top.pack(fill="x")
+        tk.Label(top, text=c["name"], bg=bg, fg=FG2 if c["quiet"] else FG, font=(FONT, 10, "bold")).pack(side="left")
+        if c["label"]:
+            tk.Label(top, text=c["label"], bg=bg, fg=FG2, font=(FONT, 8)).pack(side="left", padx=self.S(6))
+        if c["stale"]:
+            tk.Label(top, text="●", bg=bg, fg="#FB923C", font=(FONT, 8)).pack(side="right")
+        self._bar_row(card, "5 soat", c["five"], c["quiet"], bg)
+        self._bar_row(card, "Hafta", c["week"], c["quiet"], bg)
+        if c["error"] and (c["five"] is None or c["stale"]):
+            tk.Label(card, text=c["error"], bg=bg, fg="#FDBA74", font=(FONT, 8), anchor="w", justify="left",
+                     wraplength=self.S(self.WIDTH - 60)).pack(fill="x", pady=(self.S(4), 0))
+
+    def _agy_card(self, a):
+        tk = self.tk
+        card = self._card(not a["enabled"])
+        bg = CARD_QUIET if not a["enabled"] else CARD
+        top = tk.Frame(card, bg=bg, cursor="hand2")
+        top.pack(fill="x")
+        open_ = a["id"] in self.expanded
+        arrow = tk.Label(top, text=("▾ " if open_ else "▸ ") + a["id"].upper(), bg=bg, fg=FG if a["enabled"] else FG2,
+                         font=(FONT, 10, "bold"))
+        arrow.pack(side="left")
+        for wdg in (top, arrow):
+            wdg.bind("<Button-1>", lambda e, n=a["id"]: self._toggle_expand(n))
+
+        if not a["enabled"]:
+            tk.Label(top, text="o'chiq", bg=bg, fg=FG2, font=(FONT, 8)).pack(side="right")
+            return
+        if a["needsLogin"]:
+            b = tk.Label(top, text=" Kirish ", bg="#6366F1", fg="white", font=(FONT, 8, "bold"), cursor="hand2")
+            b.pack(side="right")
+            b.bind("<Button-1>", lambda e, n=a["id"]: self.store.sign_in_agy(n))
+            tk.Label(top, text="kirish kerak", bg=bg, fg="#FB923C", font=(FONT, 8)).pack(side="right", padx=self.S(6))
+            return
+
+        if not open_:   # collapsed: weekly used % per model group
+            for title, g in (("Claude&GPT", a["claude"]), ("Gemini", a["gemini"])):
+                w = g and g.get("week")
+                tk.Label(top, text=pct(w), bg=bg, fg=FG if not w or w["used"] < 70 else SEV_TEXT[severity(w["used"])],
+                         font=(FONT, 9, "bold"), width=4, anchor="e").pack(side="right")
+                tk.Label(top, text=title, bg=bg, fg=FG2, font=(FONT, 8)).pack(side="right", padx=(self.S(6), 0))
+        else:
+            for title, g in (("Gemini", a["gemini"]), ("Claude & GPT", a["claude"])):
+                tk.Label(card, text=title, bg=bg, fg=FG2, font=(FONT, 8, "bold"), anchor="w").pack(fill="x", pady=(self.S(5), 0))
+                self._bar_row(card, "5 soat", g and g.get("five"), bg=bg)
+                self._bar_row(card, "Hafta", g and g.get("week"), bg=bg)
+        if a["error"]:
+            tk.Label(card, text=a["error"], bg=bg, fg="#FDBA74", font=(FONT, 8), anchor="w", justify="left",
+                     wraplength=self.S(self.WIDTH - 60)).pack(fill="x", pady=(self.S(4), 0))
+        elif not a["fetched"]:
+            tk.Label(card, text="yuklanmoqda…", bg=bg, fg=FG2, font=(FONT, 8), anchor="w").pack(fill="x")
+
+    def _toggle_expand(self, name):
+        self.expanded ^= {name}
+        self.render()
+
+    def _menu(self, e):
+        tk = self.tk
+        m = tk.Menu(self.win, tearoff=0)
+        m.add_command(label="Hammasini ochish / yopish", command=self._expand_all)
+        m.add_command(label="Hozir yangilash", command=lambda: self.store.refresh(force=True))
+        m.add_separator()
+        agy = tk.Menu(m, tearoff=0)
+        for a in self.store.config["agy"]:
+            var = tk.BooleanVar(value=a["enabled"])
+            self.images.append(var)
+            agy.add_checkbutton(label=a["name"], variable=var, command=lambda n=a["name"], v=var: self.store.set_agy_enabled(n, v.get()))
+        agy.add_separator()
+        for a in self.store.config["agy"]:
+            agy.add_command(label=f"Kirish: {a['name']}…", command=lambda n=a["name"]: self.store.sign_in_agy(n))
+        agy.add_separator()
+        agy.add_command(label="Yangi agy akkaunt qo'shish…", command=self.add_agy)
+        m.add_cascade(label="agy akkauntlar", menu=agy)
+        cl = tk.Menu(m, tearoff=0)
+        for c in self.store.config["claude"]:
+            cl.add_command(label=f"Claude ochish / kirish: {c['name']}", command=lambda n=c["name"]: self.store.start_claude(n))
+        if not self.store.config["claude"]:
+            cl.add_command(label="(config.json'da Claude akkaunt yo'q)", state="disabled")
+        m.add_cascade(label="Claude akkauntlar", menu=cl)
+        m.add_separator()
+        m.add_command(label="Sozlamalarni ochish…", command=lambda: open_in_editor(CONFIG_PATH))
+        m.add_command(label="Sozlamalarni qayta yuklash", command=self.store.reload_config)
+        if IS_WIN:
+            var = tk.BooleanVar(value=launch_at_login())
+            self.images.append(var)
+            m.add_checkbutton(label="Windows bilan birga ishga tushirish", variable=var, command=lambda: set_launch_at_login(var.get()))
+        m.add_separator()
+        m.add_command(label="Chiqish", command=self.quit)
+        self.menu_open = True
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+            self.root.after(300, self._menu_closed)
+
+    def _menu_closed(self):
+        self.menu_open = False
+        if self.visible():
+            self.win.focus_force()
+
+    def _expand_all(self):
+        names = {a["id"] for a in self.store.view["agy"]}
+        self.expanded = set() if names <= self.expanded else names
+        self.render()
+
+    def add_agy(self):
+        acct = self.store.add_agy_account()
+        self.store.sign_in_agy(acct["name"])
+        self.q.put(("changed",))
+
+    def quit(self):
+        if self.icon:
+            self.icon.stop()
+        self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
+# ───────────────────────────── entry point ─────────────────────────────
+
+def cmd_check():
+    s = Store()
+    s.refresh(force=True, wait=True)
+    s.load()
+    v = s.view
+    print(f"config: {CONFIG_PATH}")
+    print(f"agy:    {find_agy(s.config) or 'TOPILMADI'}")
+    for c in v["claude"]:
+        print(f"claude {c['id']}: 5h={pct(c['five'])} week={pct(c['week'])}" + (f"  error={c['error']}" if c["error"] else ""))
+    for a in v["agy"]:
+        g = lambda x: f"wk={pct(x and x.get('week'))} 5h={pct(x and x.get('five'))}"
+        print(f"agy {a['id']}: enabled={a['enabled']} needsLogin={a['needsLogin']} gemini[{g(a['gemini'])}] claude[{g(a['claude'])}]"
+              + (f"  error={a['error']}" if a["error"] else ""))
+
+
+def main(argv):
+    if "--check" in argv:
+        cmd_check()
+        return
+    if "--add-agy" in argv:
+        i = argv.index("--add-agy")
+        name = argv[i + 1] if i + 1 < len(argv) and not argv[i + 1].startswith("-") else None
+        s = Store()
+        acct = s.add_agy_account(name)
+        print(f"Qo'shildi: {acct['name']}  (HOME = {expand(acct['home'])})")
+        print("Yangi oynada agy ochiladi: boshqa Google akkaunt bilan kiring, so'ng /quit yozing.")
+        s.sign_in_agy(acct["name"])
+        return
+    if not single_instance():
+        return
+    App(show="--show" in argv).run()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

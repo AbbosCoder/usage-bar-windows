@@ -1,0 +1,13 @@
+{
+  "refreshMinutes": 5,
+  "menuBarAccount": null,
+  "trayIcon": "number",
+  "agyPath": null,
+  "claude": [],
+  "agy": [
+    { "name": "agy",  "enabled": true },
+    { "name": "agy2", "home": "~/.agy-accounts/agy2", "enabled": true },
+    { "name": "agy3", "home": "~/.agy-accounts/agy3", "enabled": true }
+  ],
+  "quotaFile": null
+}
