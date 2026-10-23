@@ -98,7 +98,7 @@ Qaysi akkauntda limit ko'proq qolganini tray ikonkasidagi oynadan ko'rasiz: unda
 |---|---|
 | `agy1` (akkaunt nomi) yoki `agy-acc open agy1` | Shu akkauntga o'tib, `agy` ni ochadi |
 | `agy-acc quota` | Har bir akkaunt limiti (% ishlatilgan) |
-| `agy-acc run "vazifa"` | Vazifani agy'ga beradi: limiti ko'p qolgan gmail o'zi tanlanadi, limit tugasa keyingisiga o'tadi |
+| `agy-acc run "vazifa"` | Vazifani agy'ga beradi: limiti ko'p qolgan gmail o'zi tanlanadi, limit tugasa keyingisiga o'tadi. agy joriy papkada fayllarni o'zgartira oladi; `--read-only` — faqat javob |
 | `agy-acc current` | Hozirgi faol akkaunt nomi |
 | `agy-acc login gmail2` | gmail2 ga qayta kirish (token eskirgan / "kirish kerak" chiqqan bo'lsa) |
 | `agy-acc rename agy gmail1` | Akkaunt nomini o'zgartirish (masalan tray o'zi `agy` deb saqlagan bo'lsa) |
@@ -123,10 +123,17 @@ Shularni tray dasturi ichidan ham qilsa bo'ladi: **`•••` → agy akkauntla
 `install.bat` (yoki `python usage_bar.py --install-skill`) Claude Code uchun **`agy`** skill'ini o'rnatadi:
 `C:\Users\<siz>\.claude\skills\agy\SKILL.md`. Claude Code'ni qayta ochgach, unga shunday deyish mumkin:
 
+- "login sahifasini qil, oddiy qismlarini agy'ga ber — Claude limitini tejaylik"
+- "agy bilan shu funksiyaga testlar yozdir"
 - "agy bilan shu funksiyani review qildir"
-- "bu savolni Gemini'ga ber, Claude limitini tejaylik"
 - "agy akkauntlarimda qancha limit qoldi?"
 - yoki shunchaki `/agy ...`
 
-Claude `agy-acc run` orqali vazifani limiti eng ko'p qolgan gmail'ga beradi, javobni tekshirib sizga aytadi.
+agy Claude'ning **subagenti** bo'lib ishlaydi: qaysi qismni agy qilishini Claude o'zi hal qiladi va uni `agy-acc run` orqali
+limiti eng ko'p qolgan gmail'ga beradi. agy loyiha papkasida fayllarni o'zi yaratadi, tahrirlaydi va o'chiradi
+(`--dangerously-skip-permissions` bilan ishga tushadi). Keyin Claude `git diff` ni o'qiydi, kerak bo'lsa tuzatadi, testlarni ishga tushiradi
+va qaysi qismni agy qilganini sizga aytadi. Faqat javob kerak bo'lsa (review, savol), Claude agy'ga fayllarga tegmaslikni aytadi yoki `--read-only` ishlatadi.
+
+> agy'ga hamma ruxsat berilgani uchun, muhim loyihalarda ishni boshlashdan oldin o'zgarishlaringizni commit qilib qo'ying —
+> shunda agy nima qilgani `git diff` da aniq ko'rinadi va kerak bo'lsa osongina qaytariladi.
 Kirish (`add`, `login`) kabi brauzer kerak bo'lgan ishlarni Claude o'zi qilmaydi — ularni siz terminalda bajarasiz.

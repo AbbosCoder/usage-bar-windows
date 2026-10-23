@@ -939,7 +939,8 @@ agy-acc — bir nechta Google (gmail) akkauntni agy uchun boshqarish
   agy-acc remove NOM        saqlangan akkauntni o'chirish
   agy-acc current           hozirgi akkaunt
   agy-acc quota [--json]    har bir akkaunt limiti (% ishlatilgan)
-  agy-acc run "vazifa"      vazifani agy'ga berish: limiti ko'p qolgan gmail o'zi tanlanadi (batafsil: run --help)
+  agy-acc run "vazifa"      vazifani agy'ga berish (joriy papkada fayllarni o'zgartira oladi): limiti ko'p qolgan
+                            gmail o'zi tanlanadi (batafsil: run --help)
   agy-acc doctor            muammoni aniqlash uchun loginlar tuzilishi (tokenlarsiz)
 
   --force                   agy ochiq bo'lsa ham bajarish (tavsiya etilmaydi)
@@ -1071,16 +1072,19 @@ agy-acc run — vazifani agy'ga berish; limiti eng ko'p qolgan gmail o'zi tanlan
   agy-acc run --group claude "..."     Claude & GPT limitiga qarab tanlash (standart: gemini)
   agy-acc run --account agy2 "..."     aniq akkaunt bilan
   agy-acc run --file prompt.txt        vazifani fayldan o'qish
-  agy-acc run --include a.py:10-80 "…" fayl (yoki satrlar) mazmunini vazifaga qo'shish — agy -p o'zi fayl
-                                        o'qiy olmaydi (ruxsat so'ray olmaydi); bir necha marta berish mumkin
+  agy-acc run --include a.py:10-80 "…" fayl (yoki satrlar) mazmunini vazifaga qo'shish; bir necha marta berish mumkin
+  agy-acc run --read-only "..."        agy'ga hech qanday vosita (fayl o'qish/yozish, buyruq) ruxsat etilmaydi —
+                                        faqat javob beradi; kodni --include bilan bering
   agy-acc run --refresh "..."          avval hamma akkaunt limitini qayta tekshirish
 
+agy JORIY papkada ishlaydi va standart holatda unga hamma ruxsat beriladi (--dangerously-skip-permissions):
+fayllarni o'qiydi, yaratadi, tahrirlaydi, o'chiradi va buyruqlar ishga tushiradi. Natijani git diff bilan tekshiring.
 Limit tugagani ko'rinsa, keyingi akkaunt bilan qayta urinadi.
 """
 
 
 def cmd_run(args: list[str]) -> int:
-    group, account, refresh, prompt_file, rest, includes = "gemini", None, False, None, [], []
+    group, account, refresh, prompt_file, rest, includes, read_only = "gemini", None, False, None, [], [], False
     it = iter(args)
     for x in it:
         if x == "--group":
@@ -1093,6 +1097,8 @@ def cmd_run(args: list[str]) -> int:
             refresh = True
         elif x == "--include":
             includes.append(next(it, ""))
+        elif x == "--read-only":
+            read_only = True
         elif x in ("-h", "--help"):
             print(RUN_HELP)
             return 0
@@ -1105,7 +1111,7 @@ def cmd_run(args: list[str]) -> int:
     if not prompt.strip():
         print(RUN_HELP)
         return 2
-    # agy -p cannot ask for permission to read files, so the code to look at goes into the prompt itself
+    # with --read-only agy -p cannot use any tool, so the code to look at goes into the prompt itself
     for spec in includes:
         m = re.fullmatch(r"(.+?)(?::(\d+)(?:-(\d+))?)?", spec.strip())
         path, a, b = m.group(1), m.group(2), m.group(3)
@@ -1174,7 +1180,8 @@ def cmd_run(args: list[str]) -> int:
             email = next((o["email"] for o in rows if o["name"] == name), None)
             print(f"[agy-acc] {name}" + (f" ({email})" if email else "") + " bilan bajarilmoqda…", file=sys.stderr, flush=True)
             t0 = time.time()
-            rc, tail = _run_streaming([agy, "-p", prompt])
+            # agy works as a coding subagent: -p can't ask for permission, so tools are pre-approved unless --read-only
+            rc, tail = _run_streaming([agy] + ([] if read_only else ["--dangerously-skip-permissions"]) + ["-p", prompt])
             print(f"[agy-acc] {time.time() - t0:.0f} s (agy) · jami {time.time() - started:.0f} s", file=sys.stderr, flush=True)
             if rc != 0 and EXHAUSTED_RX.search(tail):
                 print(f"\n[agy-acc] {name} limiti tugadi — keyingi akkauntga o'tyapman.", file=sys.stderr, flush=True)

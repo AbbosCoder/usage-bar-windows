@@ -1,11 +1,11 @@
 ---
 name: agy
-description: Delegate work to Google Antigravity CLI (agy, Gemini models) using the user's several saved Google accounts — the account with the most quota left is picked automatically and the next one is tried when a limit runs out. Use when the user asks to use agy / Gemini / Antigravity, wants a second opinion or review from Gemini, wants to save Claude usage by handing off a self-contained task, or asks about agy account limits, quota, or switching agy (Gemini) accounts.
+description: Use Google Antigravity CLI (agy, Gemini models) as a coding subagent that edits the project itself — creating, changing and deleting files — so Claude saves its own usage by handing well-scoped parts of a task to agy and then reviewing the result. The user's several saved Google accounts are rotated automatically (most quota left first, next one when a limit runs out). Use when the user asks to use agy / Gemini / Antigravity, wants to save Claude limits, wants a second opinion or review from Gemini, or asks about agy account limits, quota, or switching agy (Gemini) accounts.
 ---
 
-# agy (Gemini) with several Google accounts
+# agy (Gemini) as Claude's coding subagent
 
-The user's agy logins are managed by **usage-bar-windows** (`agy-acc`). Run every command below with the Bash tool exactly as written (the path is filled in at install time):
+The user wants agy to work as **your subagent**: they give the task to you, you decide which parts agy does, agy does them directly in the project (create / edit / delete files, run commands), and you review and finish. The point is to spend fewer Claude tokens. The user's agy logins are managed by **usage-bar-windows** (`agy-acc`). Run every command below with the Bash tool exactly as written (the path is filled in at install time):
 
 ```bash
 python "{{APP}}" acc <command>
@@ -24,39 +24,54 @@ python "{{APP}}" acc quota --refresh  # check every account again first (slower:
 
 Numbers are **% used** (100 = exhausted). `needsLogin: true` means that account must be signed in again by the user.
 
-## 2. Delegate a task to agy
+## 2. Run agy
 
 ```bash
-python "{{APP}}" acc run "PROMPT"
-python "{{APP}}" acc run --file /path/to/prompt.txt     # long prompts, quotes, newlines, & | < > %
-python "{{APP}}" acc run --group claude "PROMPT"        # choose by the Claude & GPT limit instead of Gemini
-python "{{APP}}" acc run --account agy2 "PROMPT"        # a specific account
-python "{{APP}}" acc run --include src/app.py:120-180 --include README.md "PROMPT"   # put file contents in the prompt
+cd "<project root>" && python "{{APP}}" acc run --file /path/to/prompt.txt   # the usual form
+python "{{APP}}" acc run "PROMPT"                        # short prompts without quotes/newlines
+python "{{APP}}" acc run --group claude --file p.txt     # choose by the Claude & GPT limit instead of Gemini
+python "{{APP}}" acc run --account agy2 --file p.txt     # a specific account
+python "{{APP}}" acc run --read-only --include src/a.py:120-180 "PROMPT"   # answer only, no tools at all
 ```
 
-`run` picks the account with the lowest usage, switches agy to it, runs `agy -p PROMPT` in the **current directory**, streams agy's answer to stdout, and moves to the next account if agy reports an exhausted quota. A line on stderr says which account was used (`[agy-acc] agy2 (…@gmail.com) …`).
-
-If agy says it needs permission for a tool, re-run with the content passed via `--include` — don't escalate permissions.
-
-Exit codes: `0` done · `2` bad usage / agy not found · `3` every account is out of quota (show the user `acc quota`, including reset times) · `4` agy or the Antigravity app is open and the current account can't be used — ask the user to close them (`/quit`).
-
-### How to delegate well
-- **agy does not see this conversation.** Write a self-contained prompt: goal, relevant file paths, constraints, and the exact output format you want back.
-- **In `-p` mode agy cannot use its tools** (reading files, running commands): it would have to ask for permission and nobody can answer. So give it everything it needs inside the prompt — use `--include PATH[:START-END]` (repeatable) for the code to review instead of asking agy to open files. Keep it focused: the whole prompt must stay under ~30 000 characters.
-- Also say in the prompt: *"Do not modify any files; only answer."*
-- **Never** pass `--dangerously-skip-permissions` (or similar) to agy on your own: it would let agy edit files and run commands unattended. Only if the user explicitly asks agy to change files, explain that risk first; afterwards review the result yourself (`git diff`).
-- Prefer `--file` (write the prompt to a temp file first) whenever the prompt is long or contains quotes, newlines or shell metacharacters.
+- agy works in the **current directory** with **all tools pre-approved** (`--dangerously-skip-permissions`): it reads, creates, edits and deletes files and runs commands on its own. So always `cd` to the project root first and never run it from a folder it must not touch.
+- `--read-only` gives agy no tools (it can't even read files): put the code in the prompt with `--include PATH[:START-END]` (repeatable; whole prompt under ~30 000 characters). Use it for pure questions where you want a guarantee nothing changes.
+- `run` picks the account with the most quota left, switches agy to it, streams agy's answer to stdout and moves to the next account if a quota runs out. A line on stderr says which account was used (`[agy-acc] agy2 (…@gmail.com) …`).
 - agy can take minutes: give the Bash call a long timeout (up to 600000 ms) or run it in the background.
-- Treat agy's answer as a second opinion: check important claims against the code before acting on them, and tell the user what came from agy and from which account.
-- Never run plain interactive `agy`, `agy-acc add` or `agy-acc login` yourself — they need the user's browser and terminal. Never use `/logout` (it can revoke a saved account's token).
 
-## 3. Account management — the user runs these in their own terminal
+Exit codes: `0` done · `2` bad usage / agy not found · `3` every account is out of quota (show the user `acc quota`, including reset times, and do the work yourself) · `4` agy or the Antigravity app is open and the current account can't be used — ask the user to close them (`/quit`).
+
+## 3. How to use agy as a subagent
+
+**What to hand off** — well-scoped work whose result you can check quickly: implementing a function or module to a spec, boilerplate and scaffolding, writing or extending tests, mechanical refactors and renames across files, docs and comments, translating code, fixing a bug you already located. Keep for yourself: understanding the request, design decisions, anything needing this conversation's context, and final review. Several independent pieces can be separate `run` calls, one after another (agy edits the same working tree — never run two at once in one folder).
+
+**Before** — run `git status --short` so you can tell agy's changes from existing ones (if the tree is dirty, note which files already had changes). In a folder without git, list the relevant files first.
+
+**The prompt** — agy does not see this conversation. Write it to a temp file and pass `--file`. Include:
+1. The goal and the exact scope: which files to create / change / delete, and that it must not touch anything else.
+2. The relevant context: file paths to read, function names, conventions to follow (agy can read files itself).
+3. Constraints: "Do not run git commit, push, reset, checkout or any other git command that changes history or branches. Do not install packages or change config unless told. Work only inside this folder."
+4. How to verify, if there is a cheap check (e.g. "run `python -m pytest tests/test_x.py` and fix failures").
+5. What to report back: a short list of files changed and anything left undone.
+
+**After** — you are responsible for the result:
+1. `git status --short` and `git diff` (plus new untracked files): read what agy actually did; don't trust its summary alone.
+2. Revert or fix anything outside the scope or wrong (for a file agy broke, `git checkout -- FILE` only if it had no earlier uncommitted changes of the user's).
+3. Run the project's tests / checks yourself.
+4. Tell the user which parts agy did, with which account, and what you changed after it.
+
+**Second opinions / reviews** — same command; say in the prompt *"Do not modify any files; only answer."*, or use `--read-only` with `--include` when nothing may change.
+
+**Never** run plain interactive `agy`, `agy-acc add` or `agy-acc login` yourself — they need the user's browser and terminal. Never use `/logout` (it can revoke a saved account's token).
+
+## 4. Account management — the user runs these in their own terminal
 
 | Command | What it does |
 |---|---|
 | `agy-acc list` | saved accounts and their gmail (`*` = active) |
 | `agy-acc add NAME` | add another gmail (agy opens → sign in → `/quit`) |
 | `agy-acc login NAME` | sign an account in again (`needsLogin`) |
+| `agy-acc save NAME` | save the login agy has now (e.g. after agy refreshed its token: "hozirgi login hech qayerda saqlanmagan") |
 | `agy-acc use NAME` | make agy / Antigravity use NAME |
 | `NAME` (e.g. `agy1`) or `agy-acc open NAME` | switch to NAME and open agy |
 | `agy-acc rename OLD NEW`, `agy-acc email NAME GMAIL`, `agy-acc remove NAME` | housekeeping |

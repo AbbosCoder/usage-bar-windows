@@ -59,12 +59,14 @@ agy-acc use gmail2      # terminaldagi agy endi gmail2 limitidan foydalanadi
 | `agy-acc login NOM` | token eskirgan bo'lsa qayta kirish |
 | `agy-acc rename ESKI YANGI` · `email NOM GMAIL` · `remove NOM` | nomlash, gmailni yozib qo'yish, o'chirish |
 | `agy-acc quota [--json] [--refresh]` | har bir akkaunt limiti (% ishlatilgan) |
-| `agy-acc run "vazifa"` | vazifani limiti eng ko'p qolgan akkauntdagi `agy -p` ga berish (`run --help`) |
+| `agy-acc run "vazifa"` | vazifani limiti eng ko'p qolgan akkauntdagi `agy -p` ga berish. agy **joriy papkada** fayllarni yaratadi, tahrirlaydi, o'chiradi; `--read-only` — faqat javob (`run --help`) |
 | `agy-acc doctor` | muammoni aniqlash (tokenlar ko'rsatilmaydi) |
 
 > ⚠️ Saqlangan akkaunt uchun `agy` ichida **`/logout` qilmang** — Google tokeni bekor bo'lib qolishi mumkin.
 
-**Claude Code skill:** `install.bat` o'rnatgan `agy` skill'i orqali Claude Code vazifalarni limiti ko'p qolgan Gemini akkauntiga bera oladi.
+**Claude Code skill:** `install.bat` o'rnatgan `agy` skill'i bilan agy Claude Code'ning **subagenti** bo'ladi: vazifani Claude'ga berasiz,
+u bir qismini (funksiya yozish, testlar, refaktor…) limiti ko'p qolgan Gemini akkauntidagi agy'ga topshiradi, agy loyihada fayllarni o'zi
+o'zgartiradi, Claude esa `git diff` ni tekshirib ishni yakunlaydi — Claude limiti kamroq sarflanadi.
 **To'liq qo'llanma: [AGY_AKKAUNTLAR.md](AGY_AKKAUNTLAR.md).**
 
 ## Sozlamalar
