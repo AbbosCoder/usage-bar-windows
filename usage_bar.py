@@ -666,6 +666,7 @@ def describe_cred(cred: dict | None) -> str:
             parts.append(label)
     ident = cred_identity(cred)
     parts.append(f"email: {ident or 'topilmadi'}")
+    parts.append("refresh-kalit: " + ("bor" if refresh_key(cred) else "yo'q"))
     return " · ".join(parts)
 
 
@@ -691,11 +692,44 @@ def cred_identity(cred: dict | None) -> str | None:
     return None
 
 
+def refresh_key(cred: dict | None) -> str | None:
+    """Fingerprint of the Google refresh token inside a saved login. Unlike the access token (and the id_token,
+    which a refreshed login may no longer carry) it stays the same when agy refreshes, so it identifies the account."""
+    if not cred or not cred.get("blob"):
+        return None
+    import hashlib
+    for t in _blob_texts(cred["blob"]):
+        found = None
+        try:
+            stack = [json.loads(t)]
+            while stack and not found:
+                o = stack.pop()
+                if isinstance(o, dict):
+                    for k, v in o.items():
+                        if isinstance(v, str) and k.replace("_", "").lower() == "refreshtoken" and v:
+                            found = v
+                            break
+                        stack.append(v)
+                elif isinstance(o, list):
+                    stack.extend(o)
+        except Exception:
+            pass
+        if not found:
+            m = re.search(r"1//[\w-]{20,}", t)
+            found = m.group(0) if m else None
+        if found:
+            return hashlib.sha256(found.encode()).hexdigest()[:16]
+    return None
+
+
 def same_login(a: dict | None, b: dict | None) -> bool:
     if not a or not b:
         return False
     if a["blob"] == b["blob"]:
         return True
+    ra, rb = refresh_key(a), refresh_key(b)
+    if ra and rb:
+        return ra == rb
     ia, ib = cred_identity(a), cred_identity(b)
     return bool(ia and ia == ib)
 
@@ -741,7 +775,11 @@ class AgyAccounts:
     def email(self, name: str, slot: dict | None = None) -> str | None:
         if slot is None:
             slot = self.cs.read(SLOT_PREFIX + name)
-        return cred_identity(slot) or self._state().get("emails", {}).get(name)
+        known = self._state().get("emails", {}).get(name)
+        mail = cred_identity(slot)
+        if mail and not known:
+            self.set_email(name, mail)
+        return mail or known
 
     def has(self, name: str) -> bool:
         return self.cs.read(SLOT_PREFIX + name) is not None
@@ -750,6 +788,9 @@ class AgyAccounts:
         return self.cs.read(self.target)
 
     def save_slot(self, name: str, cred: dict) -> None:
+        mail = cred_identity(cred)
+        if mail and not self._state().get("emails", {}).get(name):
+            self.set_email(name, mail)   # a refreshed login may drop the id_token: remember the gmail now
         self.cs.write(SLOT_PREFIX + name, cred, f"usage-bar: agy account {name}")
 
     def matching(self, cred: dict | None) -> str | None:
@@ -1025,6 +1066,8 @@ agy-acc run — vazifani agy'ga berish; limiti eng ko'p qolgan gmail o'zi tanlan
   agy-acc run --group claude "..."     Claude & GPT limitiga qarab tanlash (standart: gemini)
   agy-acc run --account agy2 "..."     aniq akkaunt bilan
   agy-acc run --file prompt.txt        vazifani fayldan o'qish
+  agy-acc run --include a.py:10-80 "…" fayl (yoki satrlar) mazmunini vazifaga qo'shish — agy -p o'zi fayl
+                                        o'qiy olmaydi (ruxsat so'ray olmaydi); bir necha marta berish mumkin
   agy-acc run --refresh "..."          avval hamma akkaunt limitini qayta tekshirish
 
 Limit tugagani ko'rinsa, keyingi akkaunt bilan qayta urinadi.
@@ -1032,7 +1075,7 @@ Limit tugagani ko'rinsa, keyingi akkaunt bilan qayta urinadi.
 
 
 def cmd_run(args: list[str]) -> int:
-    group, account, refresh, prompt_file, rest = "gemini", None, False, None, []
+    group, account, refresh, prompt_file, rest, includes = "gemini", None, False, None, [], []
     it = iter(args)
     for x in it:
         if x == "--group":
@@ -1043,6 +1086,8 @@ def cmd_run(args: list[str]) -> int:
             prompt_file = next(it, None)
         elif x == "--refresh":
             refresh = True
+        elif x == "--include":
+            includes.append(next(it, ""))
         elif x in ("-h", "--help"):
             print(RUN_HELP)
             return 0
@@ -1054,6 +1099,23 @@ def cmd_run(args: list[str]) -> int:
     prompt = Path(prompt_file).read_text(encoding="utf-8-sig") if prompt_file else " ".join(rest)
     if not prompt.strip():
         print(RUN_HELP)
+        return 2
+    # agy -p cannot ask for permission to read files, so the code to look at goes into the prompt itself
+    for spec in includes:
+        m = re.fullmatch(r"(.+?)(?::(\d+)(?:-(\d+))?)?", spec.strip())
+        path, a, b = m.group(1), m.group(2), m.group(3)
+        try:
+            lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as e:
+            print(f"--include {spec}: o'qib bo'lmadi ({e})")
+            return 2
+        lo = int(a) if a else 1
+        hi = int(b) if b else (lo if a else len(lines))
+        chunk = "\n".join(lines[lo - 1:hi])
+        where = f"{path} (lines {lo}-{min(hi, len(lines))})" if a else path
+        prompt += f"\n\n### {where}\n```\n{chunk}\n```"
+    if len(prompt) > 30000:
+        print(f"Vazifa juda uzun ({len(prompt)} belgi, Windows chegarasi ~30000). --include'da satrlar oralig'ini toraytiring.")
         return 2
     cfg, _ = load_config()
     agy = find_agy(cfg)
