@@ -98,6 +98,7 @@ Qaysi akkauntda limit ko'proq qolganini tray ikonkasidagi oynadan ko'rasiz: unda
 |---|---|
 | `agy-acc current` | Hozirgi faol akkaunt nomi |
 | `agy-acc login gmail2` | gmail2 ga qayta kirish (token eskirgan / "kirish kerak" chiqqan bo'lsa) |
+| `agy-acc rename agy gmail1` | Akkaunt nomini o'zgartirish (masalan tray o'zi `agy` deb saqlagan bo'lsa) |
 | `agy-acc remove gmail3` | gmail3 ni ro'yxatdan o'chirish |
 | `agy-acc use gmail1 --force` | `agy` ochiq bo'lsa ham almashtirish (tavsiya etilmaydi) |
 

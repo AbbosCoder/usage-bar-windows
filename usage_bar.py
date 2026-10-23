@@ -717,6 +717,7 @@ agy-acc — bir nechta Google (gmail) akkauntni agy uchun boshqarish
   agy-acc add NOM           yangi gmail qo'shish: agy ochiladi, kirasiz, /quit — avtomatik saqlanadi
   agy-acc use NOM           agy (va Antigravity) uchun NOM akkauntiga o'tish
   agy-acc login NOM         NOM akkauntiga qayta kirish (token eskirgan bo'lsa)
+  agy-acc rename ESKI YANGI akkaunt nomini o'zgartirish
   agy-acc remove NOM        saqlangan akkauntni o'chirish
   agy-acc current           hozirgi akkaunt
 
@@ -755,7 +756,7 @@ def cmd_acc(args: list[str]) -> int:
         print("Bu buyruq faqat Windows uchun (agy logini Credential Manager'da).")
         return 1
     op, name = args[0], (args[1] if len(args) > 1 else None)
-    if op in ("save", "add", "use", "login", "remove") and not name:
+    if op in ("save", "add", "use", "login", "remove", "rename") and not name:
         print(f"Nom kerak:  agy-acc {op} NOM")
         return 1
     if name and not re.fullmatch(r"[\w.@+-]{1,40}", name):
@@ -792,13 +793,41 @@ def cmd_acc(args: list[str]) -> int:
                 return 1
             other = acc.matching(cur)
             if other and other != name and not force:
-                print(f"Bu login allaqachon '{other}' nomi bilan saqlangan.")
+                print(f"Bu login allaqachon '{other}' nomi bilan saqlangan.\n"
+                      f"Nomini o'zgartirish uchun:  agy-acc rename {other} {name}")
                 return 1
             acc.save_slot(name, cur)
             acc.set_active(name)
             _ensure_config_account(name)
             email = cred_identity(cur)
             print(f"Saqlandi: {name}" + (f" ({email})" if email else "") + " — hozir faol")
+            return 0
+
+        if op == "rename":
+            new = args[2] if len(args) > 2 else None
+            if not new or not re.fullmatch(r"[\w.@+-]{1,40}", new):
+                print("Ishlatish:  agy-acc rename ESKI YANGI")
+                return 1
+            slot = acc.cs.read(SLOT_PREFIX + name)
+            if not slot:
+                print(f"'{name}' saqlanmagan. Ro'yxat: agy-acc list")
+                return 1
+            if acc.has(new):
+                print(f"'{new}' nomi band.")
+                return 1
+            acc.save_slot(new, slot)
+            acc.cs.delete(SLOT_PREFIX + name)
+            if acc.active() == name:
+                acc.set_active(new)
+            cfg2, err = load_config()
+            if not err:
+                for a in cfg2["agy"]:
+                    if a["name"] == name:
+                        a["name"] = new
+                if not any(a["name"] == new for a in cfg2["agy"]):
+                    cfg2["agy"].append({"name": new, "home": None, "enabled": True, "env": None})
+                save_config(cfg2)
+            print(f"'{name}' → '{new}' qilib o'zgartirildi.")
             return 0
 
         if op == "remove":
@@ -1914,6 +1943,7 @@ class App:
         self.root.after(150, check)
 
     def show(self):
+        self.store.reload_if_changed()   # accounts added with agy-acc show up right away
         self.store.load()
         upd = self.store.view.get("updated")
         if not upd or time.time() - upd > 120:
