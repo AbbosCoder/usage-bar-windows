@@ -1141,8 +1141,15 @@ def cmd_acc(args: list[str]) -> int:
         if not agy:
             print("agy topilmadi.")
             return 1
-        sys.stdout.flush()
-        return subprocess.call([agy] + args[2:])
+        print(f">>> agy ochilmoqda ({args[1]}). Chiqish: /quit", flush=True)
+        try:
+            rc = subprocess.call([agy] + args[2:])
+        except OSError as e:
+            print(f"agy ishga tushmadi: {e}  ({agy})")
+            return 1
+        if rc != 0:
+            print(f"agy {rc} kodi bilan yopildi ({agy}).")
+        return rc
     cfg, _ = load_config()
     acc = AgyAccounts(cfg)
     if not acc.cs.available:
