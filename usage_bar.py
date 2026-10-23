@@ -1159,6 +1159,16 @@ class Store:
         self.view: dict = {}
         self.load()
 
+    def _saved_email(self, a: dict) -> str | None:
+        """The gmail inside a saved agy login, read once (before the first quota check has recorded it)."""
+        cache = self.__dict__.setdefault("_emails", {})
+        if a["name"] not in cache and is_swap_account(a):
+            try:
+                cache[a["name"]] = AgyAccounts(self.config).email(a["name"])
+            except Exception:
+                cache[a["name"]] = None
+        return cache.get(a["name"])
+
     # derived view model (no network)
     def load(self) -> None:
         now = time.time()
@@ -1206,7 +1216,7 @@ class Store:
             rec = arecs.get(a["name"].lower()) or {}
             agy.append({"id": a["name"], "enabled": a["enabled"], "needsLogin": bool(rec.get("needsLogin")),
                         "gemini": grp(rec.get("gemini")), "claude": grp(rec.get("claude")), "error": rec.get("error"),
-                        "email": typed_emails.get(a["name"]) or rec.get("email"),
+                        "email": typed_emails.get(a["name"]) or rec.get("email") or self._saved_email(a),
                         "fetched": bool(rec.get("fetchedAt"))})
 
         mb = next((c for c in claude if c["id"].lower() == (cfg.get("menuBarAccount") or "").lower()), claude[0] if claude else None)
