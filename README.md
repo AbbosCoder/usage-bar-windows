@@ -3,7 +3,7 @@
 **Claude Code** va **agy** (Google Antigravity CLI / Gemini) akkauntlaringizning **5 soatlik** va **haftalik** limitlarini bitta joyda ko'rsatadigan kichik Windows tray dasturi.
 Asl macOS dasturi ([usage-bar](https://github.com/thexayotbe/usage-bar)) ning Windows 11 uchun Python porti.
 
-![popover](docs/popover.png)
+![popover](docs/popover.png) ![popover light](docs/popover-light.png)
 
 - **Tray ikonka** (soat yonida): halqa + raqam = 5 soatlik limitning necha foizi ishlatilgan.
   Rang: yashil < 70 · sariq 70–85 · to'q sariq 85–95 · qizil ≥ 95. Kichik to'q sariq nuqta = qaysidir akkauntga kirish kerak yoki ma'lumot eskirgan.
@@ -49,6 +49,7 @@ Fayl: `C:\Users\<siz>\.config\usage-bar\config.json` (birinchi ishga tushishda a
 |---|---|
 | `refreshMinutes` | Har necha daqiqada yangilash (standart 5). Claude API 5 daqiqadan tez so'ralmaydi. |
 | `menuBarAccount` | Tray ikonkada ko'rsatiladigan Claude akkaunt nomi (standart: birinchisi). |
+| `theme` | Oyna mavzusi: `"auto"` (Windows sozlamasiga qarab), `"dark"` yoki `"light"`. |
 | `trayIcon` | `"number"` (halqa + raqam) yoki `"rings"` (ikki halqa: tashqi 5 soat, ichki hafta). |
 | `agyPath` | `agy` topilmasa, uning to'liq yo'li, masalan `"C:/Users/siz/AppData/Roaming/npm/agy.cmd"`. |
 | `claude[]` | `{ "name", "label"?, "configDir" }` — Claude Code config papkasi (`~/.claude`). `label: "reserve"` kartani xiraroq qiladi. |

@@ -69,6 +69,7 @@ def normalize_config(raw: dict) -> dict:
         "refreshMinutes": int(raw.get("refreshMinutes") or 5),
         "menuBarAccount": raw.get("menuBarAccount"),
         "trayIcon": raw.get("trayIcon") or "number",
+        "theme": raw.get("theme") or "auto",
         "agyPath": raw.get("agyPath"),
         "agyCredential": raw.get("agyCredential") or None,
         "claude": [],
@@ -103,6 +104,7 @@ def save_config(cfg: dict) -> None:
         "refreshMinutes": cfg["refreshMinutes"],
         "menuBarAccount": cfg.get("menuBarAccount"),
         "trayIcon": cfg.get("trayIcon", "number"),
+        "theme": cfg.get("theme", "auto"),
         "agyPath": cfg.get("agyPath"),
         **({"agyCredential": cfg["agyCredential"]} if cfg.get("agyCredential") else {}),
         "claude": [{k: v for k, v in c.items() if v is not None} for c in cfg["claude"]],
@@ -1173,7 +1175,6 @@ STOPS = [((0x22, 0xD3, 0xEE), (0x34, 0xD3, 0x99)),   # calm: cyan → emerald
          ((0xFD, 0xE0, 0x47), (0xF5, 0x9E, 0x0B)),   # amber
          ((0xFD, 0xBA, 0x74), (0xF9, 0x73, 0x16)),   # orange
          ((0xFC, 0xA5, 0xA5), (0xEF, 0x44, 0x44))]   # red
-SEV_TEXT = ["#34D399", "#FBBF24", "#FB923C", "#F87171"]
 ORANGE = (0xFB, 0x92, 0x3C)
 
 
@@ -1241,26 +1242,6 @@ def make_tray_icon(five, week, attention, style="number", light=False):
         d.ellipse((S - 92, 0, S, 92), fill=(0, 0, 0, 0))
         d.ellipse((S - 80, 8, S - 8, 80), fill=ORANGE)
     return img.resize((64, 64), Image.LANCZOS)
-
-
-def make_bar(width, height, p, quiet=False, light=False):
-    from PIL import Image, ImageDraw
-    k = 4
-    W, H = width * k, height * k
-    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.rounded_rectangle((0, 0, W - 1, H - 1), radius=H // 2, fill=(255, 255, 255, 22))
-    if p is not None and p > 0.5:
-        fw = max(H, int(W * min(p, 100) / 100))
-        a, b = STOPS[severity(p)]
-        grad = Image.new("RGBA", (fw, H))
-        gd = ImageDraw.Draw(grad)
-        for x in range(fw):
-            gd.line([(x, 0), (x, H)], fill=_mix(a, b, x / max(fw - 1, 1)) + (150 if quiet else 255,))
-        mask = Image.new("L", (fw, H), 0)
-        ImageDraw.Draw(mask).rounded_rectangle((0, 0, fw - 1, H - 1), radius=H // 2, fill=255)
-        img.paste(grad, (0, 0), mask)
-    return img.resize((width, height), Image.LANCZOS)
 
 
 # ───────────────────────────── Windows helpers ─────────────────────────────
@@ -1331,15 +1312,449 @@ def open_in_editor(path: Path) -> None:
 
 # ───────────────────────────── UI (tkinter popover + pystray) ─────────────────────────────
 
-BG = "#0B0C10"
-CARD = "#15161B"
-CARD_QUIET = "#111216"
-BORDER = "#23252C"
-FG = "#F2F2F5"
-FG2 = "#8B8D98"
-ACCENT = "#A5B4FC"
-ALERT_BG = "#3A2414"
-FONT = "Segoe UI" if IS_WIN else "DejaVu Sans"
+PALETTES = {
+    "dark": {
+        "panel": (32, 32, 36), "key": (1, 2, 3), "border": (255, 255, 255, 26),
+        "card": (255, 255, 255, 11), "card_hover": (255, 255, 255, 19), "card_quiet": (255, 255, 255, 6),
+        "card_border": (255, 255, 255, 14),
+        "fg": (244, 244, 247), "fg2": (165, 167, 178), "fg3": (112, 114, 126),
+        "track": (255, 255, 255, 24), "chip": (255, 255, 255, 16), "btn_hover": (255, 255, 255, 22),
+        "accent": (110, 120, 245), "accent_hover": (128, 138, 250), "accent_fg": (255, 255, 255),
+        "alert_bg": (251, 146, 60, 34), "alert_fg": (253, 186, 116), "warn": (251, 146, 60),
+        "sev": [(110, 231, 183), (252, 211, 77), (253, 166, 96), (248, 113, 113)],
+    },
+    "light": {
+        "panel": (246, 246, 248), "key": (196, 196, 201), "border": (0, 0, 0, 30),
+        "card": (255, 255, 255, 235), "card_hover": (255, 255, 255, 255), "card_quiet": (255, 255, 255, 140),
+        "card_border": (0, 0, 0, 16),
+        "fg": (22, 22, 26), "fg2": (88, 90, 102), "fg3": (138, 140, 150),
+        "track": (0, 0, 0, 20), "chip": (0, 0, 0, 10), "btn_hover": (0, 0, 0, 12),
+        "accent": (79, 70, 229), "accent_hover": (99, 90, 240), "accent_fg": (255, 255, 255),
+        "alert_bg": (234, 88, 12, 26), "alert_fg": (180, 65, 12), "warn": (217, 98, 12),
+        "sev": [(5, 150, 105), (202, 138, 4), (234, 88, 12), (220, 38, 38)],
+    },
+}
+
+
+def apps_use_light_theme() -> bool:
+    if not IS_WIN:
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 1
+    except OSError:
+        return False
+
+
+_FONT_CACHE: dict = {}
+
+
+def ui_font(px: int, weight: str = "regular"):
+    """Segoe UI on Windows (regular / semibold / bold), DejaVu elsewhere."""
+    key = (px, weight)
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
+    from PIL import ImageFont
+    names = {"regular": ["segoeui.ttf", "DejaVuSans.ttf"],
+             "semibold": ["seguisb.ttf", "segoeuib.ttf", "DejaVuSans-Bold.ttf"],
+             "bold": ["segoeuib.ttf", "DejaVuSans-Bold.ttf"]}[weight]
+    dirs = [os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")] if IS_WIN else []
+    dirs += ["/usr/share/fonts/truetype/dejavu", ""]
+    font = None
+    for n in names:
+        for d in dirs:
+            try:
+                font = ImageFont.truetype(os.path.join(d, n) if d else n, px)
+                break
+            except OSError:
+                continue
+        if font:
+            break
+    _FONT_CACHE[key] = font or ImageFont.load_default(px)
+    return _FONT_CACHE[key]
+
+
+def icon_font(px: int):
+    """Segoe Fluent Icons (Win 11) / Segoe MDL2 Assets (Win 10), or None."""
+    key = ("icons", px)
+    if key not in _FONT_CACHE:
+        from PIL import ImageFont
+        _FONT_CACHE[key] = None
+        if IS_WIN:
+            for n in ("SegoeIcons.ttf", "segmdl2.ttf"):
+                try:
+                    _FONT_CACHE[key] = ImageFont.truetype(os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", n), px)
+                    break
+                except OSError:
+                    continue
+    return _FONT_CACHE[key]
+
+
+class Painter:
+    """Draws the whole popover as one anti-aliased image and returns clickable regions.
+    Sizes are in 96-dpi pixels and scaled by `scale`."""
+
+    W = 372
+    PAD = 16
+    SS = 4   # supersampling for shapes
+
+    def __init__(self, scale: float, theme: str):
+        from PIL import Image, ImageDraw
+        self.Image, self.ImageDraw = Image, ImageDraw
+        self.k = scale
+        self.p = PALETTES[theme]
+        self.theme = theme
+
+    def s(self, v) -> int:
+        return int(round(v * self.k))
+
+    def f(self, px, weight="regular"):
+        return ui_font(max(6, self.s(px)), weight)
+
+    # primitives
+    def rrect(self, box, r, fill, outline=None, width=1):
+        Image, ImageDraw = self.Image, self.ImageDraw
+        x0, y0, x1, y1 = [int(round(v)) for v in box]
+        w, h = x1 - x0, y1 - y0
+        if w <= 0 or h <= 0:
+            return
+        S = self.SS
+        if fill is not None:
+            m = Image.new("L", (w * S, h * S), 0)
+            ImageDraw.Draw(m).rounded_rectangle((0, 0, w * S - 1, h * S - 1), radius=r * S, fill=255)
+            self._paint(m.resize((w, h), Image.LANCZOS), (x0, y0), fill)
+        if outline is not None:
+            m = Image.new("L", (w * S, h * S), 0)
+            ImageDraw.Draw(m).rounded_rectangle((0, 0, w * S - 1, h * S - 1), radius=r * S, outline=255, width=max(1, int(width * S)))
+            self._paint(m.resize((w, h), Image.LANCZOS), (x0, y0), outline)
+
+    def _paint(self, mask, xy, color):
+        a = color[3] if len(color) == 4 else 255
+        if a < 255:
+            mask = mask.point(lambda v: v * a // 255)
+        layer = self.Image.new("RGBA", mask.size, tuple(color[:3]) + (255,))
+        layer.putalpha(mask)
+        self.img.alpha_composite(layer, dest=(int(xy[0]), int(xy[1])))
+
+    def shape(self, xy, size, fn):
+        """fn(draw, S) draws at SS-times size on an RGBA layer, which is then downsampled and composited."""
+        Image = self.Image
+        w, h = int(size[0]), int(size[1])
+        S = self.SS
+        layer = Image.new("RGBA", (w * S, h * S), (0, 0, 0, 0))
+        fn(self.ImageDraw.Draw(layer), S)
+        self.img.alpha_composite(layer.resize((w, h), Image.LANCZOS), dest=(int(xy[0]), int(xy[1])))
+
+    def text(self, xy, s, font, fill, anchor="la"):
+        self.draw.text(xy, s, font=font, fill=tuple(fill[:3]), anchor=anchor)
+
+    def tw(self, s, font) -> float:
+        return font.getlength(s)
+
+    def wrap(self, s, font, maxw):
+        lines, cur = [], ""
+        for word in s.split():
+            t = (cur + " " + word).strip()
+            if self.tw(t, font) <= maxw or not cur:
+                cur = t
+            else:
+                lines.append(cur)
+                cur = word
+        if cur:
+            lines.append(cur)
+        return lines
+
+    def bar(self, x, y, w, h, p, quiet=False):
+        Image = self.Image
+        self.rrect((x, y, x + w, y + h), h / 2, self.p["track"])
+        if p is None or p <= 0.4:
+            return
+        fw = max(h, int(round(w * min(p, 100) / 100)))
+        a, b = STOPS[severity(p)]
+        row = Image.new("RGBA", (fw, 1))
+        row.putdata([_mix(a, b, i / max(fw - 1, 1)) + (170 if quiet else 255,) for i in range(fw)])
+        grad = row.resize((fw, h))
+        S = self.SS
+        m = Image.new("L", (fw * S, h * S), 0)
+        self.ImageDraw.Draw(m).rounded_rectangle((0, 0, fw * S - 1, h * S - 1), radius=h * S / 2, fill=255)
+        m = m.resize((fw, h), Image.LANCZOS)
+        alpha = Image.composite(grad.getchannel("A"), Image.new("L", (fw, h), 0), m)
+        grad.putalpha(alpha)
+        self.img.alpha_composite(grad, dest=(int(x), int(y)))
+
+    def ring(self, x, y, d, p):
+        track = self.p["track"]
+
+        def fn(dr, S):
+            w = max(2, d * S // 7)
+            box = (w // 2, w // 2, d * S - w // 2 - 1, d * S - w // 2 - 1)
+            dr.ellipse(box, outline=track, width=w)
+            if p is not None and p > 0.4:
+                _arc(dr, box, min(p / 100, 1), w, severity(p), n=90)
+        self.shape((x, y), (d, d), fn)
+
+    def chevron(self, x, y, size, down, color):
+        def fn(dr, S):
+            z = size * S
+            lw = max(1, int(1.6 * self.k * S))
+            if down:
+                pts = [(z * 0.2, z * 0.38), (z * 0.5, z * 0.66), (z * 0.8, z * 0.38)]
+            else:
+                pts = [(z * 0.38, z * 0.2), (z * 0.66, z * 0.5), (z * 0.38, z * 0.8)]
+            dr.line(pts, fill=tuple(color[:3]) + (255,), width=lw, joint="curve")
+            for px, py in (pts[0], pts[2]):
+                dr.ellipse((px - lw / 2, py - lw / 2, px + lw / 2, py + lw / 2), fill=tuple(color[:3]) + (255,))
+        self.shape((x, y), (size, size), fn)
+
+    def refresh_glyph(self, x, y, size, color):
+        f = icon_font(self.s(15))
+        if f:
+            self.draw.text((x + size / 2, y + size / 2), "\uE72C", font=f, fill=tuple(color[:3]), anchor="mm")
+            return
+
+        def fn(dr, S):
+            z = size * S
+            lw = max(1, int(1.7 * self.k * S))
+            m = z * 0.2
+            import math
+            dr.arc((m, m, z - m, z - m), 320, 250, fill=tuple(color[:3]) + (255,), width=lw)
+            cx = cy = z / 2
+            r = (z - 2 * m) / 2 - lw / 2
+            t = math.radians(250)                       # arc end; clockwise tangent = (-sin, cos)
+            ex, ey = cx + r * math.cos(t), cy + r * math.sin(t)
+            dx, dy = -math.sin(t), math.cos(t)
+            nx, ny = math.cos(t), math.sin(t)
+            a = z * 0.17
+            dr.polygon([(ex + dx * a, ey + dy * a), (ex - dx * a * 0.3 + nx * a, ey - dy * a * 0.3 + ny * a),
+                        (ex - dx * a * 0.3 - nx * a, ey - dy * a * 0.3 - ny * a)], fill=tuple(color[:3]) + (255,))
+        self.shape((x, y), (size, size), fn)
+
+    def dots(self, cx, cy, color):
+        f = icon_font(self.s(16))
+        if f:
+            self.draw.text((cx, cy), "\uE712", font=f, fill=tuple(color[:3]), anchor="mm")
+            return
+        r = max(1.5, 1.6 * self.k)
+        gap = self.s(6)
+        for i in (-1, 0, 1):
+            self.shape((cx + i * gap - r - 1, cy - r - 1), (2 * r + 2, 2 * r + 2),
+                       lambda dr, S, r=r: dr.ellipse((S, S, (2 * r + 1) * S, (2 * r + 1) * S), fill=tuple(color[:3]) + (255,)))
+
+    # the popover
+    def render(self, view, expanded, hover, refreshing, max_h=None, scroll=0):
+        Image, ImageDraw = self.Image, self.ImageDraw
+        P, s = self.p, self.s
+        W = s(self.W)
+        self.img = Image.new("RGBA", (W, s(2400)), tuple(P["panel"]) + (255,))
+        self.draw = ImageDraw.Draw(self.img)
+        regions = []
+        pad = s(self.PAD)
+        x0, x1 = pad, W - pad
+        y = s(14)
+
+        # header
+        self.text((x0, y + s(15)), "Usage", self.f(18, "semibold"), P["fg"], "ls")
+        bsz = s(30)
+        bx, by = x1 - bsz + s(6), y - s(5)
+        if hover == "refresh":
+            self.rrect((bx, by, bx + bsz, by + bsz), s(8), P["btn_hover"])
+        self.refresh_glyph(bx + s(6), by + s(6), s(18), P["fg2"] if refreshing else P["fg"])
+        regions.append(((bx, by, bx + bsz, by + bsz), ("refresh",), "refresh"))
+        status = "yangilanmoqda…" if refreshing else fmt_ago(view.get("updated"))
+        self.text((bx - s(6), y + s(14)), status, self.f(12), P["fg3"], "rs")
+        y += s(30)
+
+        if view.get("alert"):
+            y += s(4)
+            fa = self.f(12.5)
+            lines = self.wrap(view["alert"], fa, x1 - x0 - s(40))
+            h = s(16) + len(lines) * s(17)
+            self.rrect((x0, y, x1, y + h), s(9), P["alert_bg"])
+            self.shape((x0 + s(12), y + s(13)), (s(8), s(8)), lambda dr, S: dr.ellipse((0, 0, 8 * self.k * S - 1, 8 * self.k * S - 1), fill=tuple(P["warn"]) + (255,)))
+            for i, ln in enumerate(lines):
+                self.text((x0 + s(28), y + s(8) + i * s(17)), ln, fa, P["alert_fg"])
+            y += h + s(6)
+
+        def section(title):
+            nonlocal y
+            y += s(12)
+            self.text((x0 + s(2), y), title, self.f(11, "semibold"), P["fg3"])
+            y += s(22)
+
+        def row(label, w, quiet=False, indent=0):
+            nonlocal y
+            fl, fp, fr = self.f(13), self.f(13, "semibold"), self.f(12)
+            cy = y + s(11)
+            self.text((x0 + s(14) + indent, cy), label, fl, P["fg2"], "lm")
+            bx0 = x0 + s(82) + indent
+            bx1 = x1 - s(140)
+            self.bar(bx0, cy - s(3), bx1 - bx0, s(6), w["used"] if w else None, quiet)
+            if w:
+                sev = severity(w["used"])
+                col = P["fg"] if sev == 0 else P["sev"][sev]
+                if quiet:
+                    col = P["fg2"]
+                self.text((x1 - s(78), cy), pct(w), fp, col, "rm")
+                self.text((x1 - s(14), cy), fmt_reset(w["resets"]), fr, P["fg3"], "rm")
+            else:
+                self.text((x1 - s(78), cy), "–", fp, P["fg3"], "rm")
+            y += s(25)
+
+        def card(top, bottom, hid=None, quiet=False):
+            fill = P["card_quiet"] if quiet else (P["card_hover"] if hid and hover == hid else P["card"])
+            self.rrect((x0, top, x1, bottom), s(10), fill, P["card_border"])
+
+        # cards are drawn after their content height is known: draw content on a scratch layer
+        def boxed(draw_fn, hid=None, quiet=False):
+            nonlocal y
+            top = y
+            saved = self.img
+            self.img = Image.new("RGBA", saved.size, (0, 0, 0, 0))
+            self.draw = ImageDraw.Draw(self.img)
+            y += s(10)
+            draw_fn()
+            y += s(8)
+            content = self.img
+            self.img, self.draw = saved, ImageDraw.Draw(saved)
+            card(top, y, hid, quiet)
+            self.img.alpha_composite(content)
+            self.draw = ImageDraw.Draw(self.img)
+            y += s(8)
+            return top
+
+        claude, agy = view["claude"], view["agy"]
+        if claude:
+            section("CLAUDE CODE")
+            for c in claude:
+                def body(c=c):
+                    nonlocal y
+                    fname = self.f(14, "semibold")
+                    cy = y + s(10)
+                    self.text((x0 + s(14), cy), c["name"], fname, P["fg2"] if c["quiet"] else P["fg"], "lm")
+                    nx = x0 + s(14) + self.tw(c["name"], fname) + s(8)
+                    if c["label"]:
+                        fl = self.f(11)
+                        lw = self.tw(c["label"], fl) + s(14)
+                        self.rrect((nx, cy - s(9), nx + lw, cy + s(9)), s(9), P["chip"])
+                        self.text((nx + lw / 2, cy), c["label"], fl, P["fg2"], "mm")
+                    nodata = c["five"] is None and c["week"] is None
+                    if c["error"] and nodata:
+                        self.text((x1 - s(14), cy), "login yo'q", self.f(12), P["fg3"], "rm")
+                        y += s(22)
+                        for ln in self.wrap(c["error"], self.f(12), x1 - x0 - s(28)):
+                            self.text((x0 + s(14), y), ln, self.f(12), P["fg3"])
+                            y += s(17)
+                        return
+                    if c["stale"]:
+                        self.text((x1 - s(14), cy), "eski ma'lumot", self.f(11), P["warn"], "rm")
+                    y += s(26)
+                    row("5 soat", c["five"], c["quiet"])
+                    row("Hafta", c["week"], c["quiet"])
+                    if c["error"] and c["stale"]:
+                        for ln in self.wrap(c["error"], self.f(11.5), x1 - x0 - s(28)):
+                            self.text((x0 + s(14), y), ln, self.f(11.5), P["fg3"])
+                            y += s(16)
+                boxed(body, quiet=c["quiet"])
+
+        if agy:
+            section("AGY · GEMINI")
+            for a in agy:
+                hid = "agy:" + a["id"]
+                is_open = a["id"] in expanded and a["enabled"] and not a["needsLogin"]
+
+                def body(a=a, is_open=is_open, hid=hid):
+                    nonlocal y
+                    top = y - s(10)
+                    fname = self.f(14, "semibold")
+                    cy = y + s(10)
+                    on = a["enabled"]
+                    self.chevron(x0 + s(10), cy - s(8), s(16), is_open, P["fg2"] if on else P["fg3"])
+                    self.text((x0 + s(30), cy), a["id"].upper(), fname, P["fg"] if on else P["fg3"], "lm")
+                    regions.append(((x0, top, x1, cy + s(18)), ("toggle", a["id"]), hid))
+                    if not on:
+                        self.text((x1 - s(14), cy), "o'chiq", self.f(12), P["fg3"], "rm")
+                        y += s(22)
+                        return
+                    if a["needsLogin"]:
+                        fb = self.f(12, "semibold")
+                        bw = self.tw("Kirish", fb) + s(22)
+                        bxx = x1 - s(12) - bw
+                        bid = "signin:" + a["id"]
+                        self.rrect((bxx, cy - s(12), bxx + bw, cy + s(12)), s(7), P["accent_hover"] if hover == bid else P["accent"])
+                        self.text((bxx + bw / 2, cy), "Kirish", fb, P["accent_fg"], "mm")
+                        regions.insert(0, ((bxx, cy - s(12), bxx + bw, cy + s(12)), ("signin", a["id"]), bid))
+                        self.text((bxx - s(10), cy), "kirish kerak", self.f(12), P["warn"], "rm")
+                        y += s(22)
+                        return
+                    if not is_open:
+                        fl, fp = self.f(11.5), self.f(12.5, "semibold")
+                        xr = x1 - s(14)
+                        for title, g in (("Claude", a["claude"]), ("Gemini", a["gemini"])):
+                            w = g and g.get("week")
+                            five = g and g.get("five")
+                            show = max([v["used"] for v in (w, five) if v] or [0]) if (w or five) else None
+                            label = "–" if show is None else f"{round(show)}%"
+                            sev = severity(show or 0)
+                            self.text((xr, cy), label, fp, P["fg"] if sev == 0 else P["sev"][sev], "rm")
+                            xr -= max(self.tw(label, fp), self.tw("88%", fp)) + s(5)
+                            self.ring(xr - s(14), cy - s(7), s(14), show)
+                            xr -= s(14) + s(5)
+                            self.text((xr, cy), title, fl, P["fg3"], "rm")
+                            xr -= self.tw(title, fl) + s(14)
+                        y += s(22)
+                    else:
+                        y += s(24)
+                        for title, g in (("Gemini", a["gemini"]), ("Claude & GPT", a["claude"])):
+                            self.text((x0 + s(14), y + s(6)), title, self.f(11.5, "semibold"), P["fg3"], "lm")
+                            y += s(16)
+                            row("5 soat", g and g.get("five"))
+                            row("Hafta", g and g.get("week"))
+                            y += s(2)
+                    if a["error"]:
+                        y += s(4)
+                        for ln in self.wrap(a["error"], self.f(11.5), x1 - x0 - s(28)):
+                            self.text((x0 + s(14), y), ln, self.f(11.5), P["warn"])
+                            y += s(16)
+                    elif not a["fetched"]:
+                        y += s(2)
+                        self.text((x0 + s(30), y), "yuklanmoqda…", self.f(11.5), P["fg3"])
+                        y += s(16)
+                boxed(body, hid=hid, quiet=not a["enabled"])
+
+        if not claude and not agy:
+            y += s(16)
+            self.text((W / 2, y), "Akkaunt topilmadi — ••• → Sozlamalarni ochish", self.f(12.5), P["fg3"], "mt")
+            y += s(30)
+
+        # footer
+        y += s(4)
+        n_agy = len([a for a in agy if a["enabled"]])
+        parts = ([f"{len(claude)} Claude"] if claude else []) + ([f"{n_agy} agy"] if agy else [])
+        self.text((x0 + s(2), y + s(13)), " · ".join(parts), self.f(12), P["fg3"], "lm")
+        mw, mh = s(38), s(26)
+        mx = x1 - mw
+        if hover == "menu":
+            self.rrect((mx, y, mx + mw, y + mh), s(7), P["btn_hover"])
+        self.dots(mx + mw / 2, y + mh / 2, P["fg"])
+        regions.append(((mx, y, mx + mw, y + mh), ("menu",), "menu"))
+        y += mh + s(12)
+
+        # window: rounded panel over the transparent key colour
+        H = y
+        vis = H if not max_h or H <= max_h else max_h
+        scroll = max(0, min(scroll, H - vis))
+        body = self.img.crop((0, scroll, W, scroll + vis))
+        out = Image.new("RGBA", (W, vis), tuple(P["key"]) + (255,))
+        S = self.SS
+        m = Image.new("L", (W * S, vis * S), 0)
+        r = s(12)
+        ImageDraw.Draw(m).rounded_rectangle((0, 0, W * S - 1, vis * S - 1), radius=r * S, fill=255)
+        out.paste(body, (0, 0), m.resize((W, vis), Image.LANCZOS))
+        self.img, self.draw = out, ImageDraw.Draw(out)
+        self.rrect((0, 0, W, vis), r, None, P["border"], width=1)
+        regions = [((bx0, by0 - scroll, bx1, by1 - scroll), act, hid) for (bx0, by0, bx1, by1), act, hid in regions]
+        return out.convert("RGB"), regions, H, scroll
 
 
 class App:
@@ -1462,28 +1877,32 @@ class App:
         self.store.refresh()   # every account has its own minimum interval
         self.root.after(60_000, self._tick60)
 
-    # popover window
+    # popover window: one borderless window showing the Painter's image
+    def _theme(self):
+        t = (self.store.config.get("theme") or "auto").lower()
+        if t in ("dark", "light"):
+            return t
+        return "light" if apps_use_light_theme() else "dark"
+
     def _build_window(self):
         tk = self.tk
         w = tk.Toplevel(self.root)
         w.withdraw()
         w.overrideredirect(True)
         w.attributes("-topmost", True)
-        w.configure(bg=BORDER)
         w.bind("<Escape>", lambda e: self.hide())
         w.bind("<FocusOut>", self._focus_out)
         self.win = w
-        self.frame = tk.Frame(w, bg=BG, padx=self.S(14), pady=self.S(12))
-        self.frame.pack(fill="both", expand=True, padx=1, pady=1)
-        if IS_WIN:
-            w.update_idletasks()
-            try:   # Windows 11 rounded corners
-                import ctypes
-                hwnd = ctypes.windll.user32.GetParent(w.winfo_id())
-                pref = ctypes.c_int(2)
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(pref), ctypes.sizeof(pref))
-            except Exception:
-                pass
+        self.label = tk.Label(w, bd=0, highlightthickness=0, cursor="arrow")
+        self.label.pack()
+        self.label.bind("<Motion>", self._motion)
+        self.label.bind("<Leave>", lambda e: self._set_hover(None))
+        self.label.bind("<Button-1>", self._click)
+        self.label.bind("<MouseWheel>", self._wheel)
+        self.regions = []
+        self.hover = None
+        self.scroll = 0
+        self.photo = None
 
     def visible(self):
         return self.win is not None and self.win.winfo_viewable()
@@ -1499,6 +1918,7 @@ class App:
         upd = self.store.view.get("updated")
         if not upd or time.time() - upd > 120:
             self.store.refresh()
+        self.scroll = 0
         self.render()
         self.win.deiconify()
         self.win.lift()
@@ -1507,148 +1927,65 @@ class App:
     def hide(self):
         self.win.withdraw()
 
-    def _place(self):
-        self.win.update_idletasks()
-        w, h = self.S(self.WIDTH), self.win.winfo_reqheight()
+    def _work_area(self):
         wa = work_area()
         if wa:
-            _, t, r, b = wa
-        else:
-            _, t, r, b = 0, 0, self.win.winfo_screenwidth(), self.win.winfo_screenheight() - self.S(48)
-        h = min(h, b - t - self.S(24))
-        self.win.geometry(f"{w}x{h}+{r - w - self.S(12)}+{b - h - self.S(12)}")
-
-    # rendering
-    def _img(self, pil):
-        import base64
-        import io
-        buf = io.BytesIO()
-        pil.save(buf, "PNG")
-        im = self.tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
-        self.images.append(im)
-        return im
+            return wa
+        return 0, 0, self.win.winfo_screenwidth(), self.win.winfo_screenheight() - self.S(48)
 
     def render(self):
-        tk = self.tk
-        for c in self.frame.winfo_children():
-            c.destroy()
-        self.images = []
-        v = self.store.view
-        f = self.frame
+        import base64
+        import io
+        theme = self._theme()
+        painter = Painter(self.scale, theme)
+        _, t, r, b = self._work_area()
+        img, self.regions, full_h, self.scroll = painter.render(
+            self.store.view, self.expanded, self.hover, self.store.refreshing, max_h=b - t - self.S(24), scroll=self.scroll)
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        self.photo = self.tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
+        self.label.configure(image=self.photo, bg="#%02x%02x%02x" % PALETTES[theme]["key"])
+        self.win.configure(bg="#%02x%02x%02x" % PALETTES[theme]["key"])
+        try:   # rounded corners: the key colour around the panel becomes see-through (Windows)
+            self.win.attributes("-transparentcolor", "#%02x%02x%02x" % PALETTES[theme]["key"])
+        except Exception:
+            pass
+        w, h = img.size
+        self.win.geometry(f"{w}x{h}+{r - w - self.S(12)}+{b - h - self.S(12)}")
 
-        head = tk.Frame(f, bg=BG)
-        head.pack(fill="x")
-        tk.Label(head, text="Usage", bg=BG, fg=FG, font=(FONT, 13, "bold")).pack(side="left")
-        btn = tk.Label(head, text="⟳", bg=BG, fg=ACCENT if not self.store.refreshing else FG2, font=(FONT, 13), cursor="hand2")
-        btn.pack(side="right")
-        btn.bind("<Button-1>", lambda e: self.store.refresh(force=True))
-        status = "yangilanmoqda…" if self.store.refreshing else fmt_ago(v.get("updated"))
-        tk.Label(head, text=status, bg=BG, fg=FG2, font=(FONT, 8)).pack(side="right", padx=self.S(8))
+    def _hit(self, x, y):
+        for (x0, y0, x1, y1), act, hid in self.regions:
+            if x0 <= x < x1 and y0 <= y < y1:
+                return act, hid
+        return None, None
 
-        if v.get("alert"):
-            a = tk.Label(f, text="⚠  " + v["alert"], bg=ALERT_BG, fg="#FDBA74", font=(FONT, 9), anchor="w", justify="left",
-                         wraplength=self.S(self.WIDTH - 50), padx=self.S(10), pady=self.S(6))
-            a.pack(fill="x", pady=(self.S(10), 0))
+    def _set_hover(self, hid):
+        if hid != self.hover:
+            self.hover = hid
+            self.label.configure(cursor="hand2" if hid else "arrow")
+            self.render()
 
-        if v["claude"]:
-            self._section("CLAUDE")
-            for c in v["claude"]:
-                self._claude_card(c)
-        if v["agy"]:
-            self._section("AGY · GEMINI")
-            for a in v["agy"]:
-                self._agy_card(a)
-        if not v["claude"] and not v["agy"]:
-            tk.Label(f, text="Akkaunt topilmadi. … → Sozlamalarni ochish", bg=BG, fg=FG2, font=(FONT, 9)).pack(pady=self.S(16))
+    def _motion(self, e):
+        self._set_hover(self._hit(e.x, e.y)[1])
 
-        foot = tk.Frame(f, bg=BG)
-        foot.pack(fill="x", pady=(self.S(10), 0))
-        more = tk.Label(foot, text="  •••  ", bg=CARD, fg=FG, font=(FONT, 10, "bold"), cursor="hand2")
-        more.pack(side="right")
-        more.bind("<Button-1>", lambda e: self._menu(e))
-        tk.Label(foot, text=f"{len(v['claude'])} Claude · {len([a for a in v['agy'] if a['enabled']])} agy",
-                 bg=BG, fg=FG2, font=(FONT, 8)).pack(side="left")
-        self._place()
+    def _wheel(self, e):
+        self.scroll = max(0, self.scroll - int(e.delta / 120 * self.S(60)))
+        self.render()
 
-    def _section(self, title):
-        self.tk.Label(self.frame, text=title, bg=BG, fg=FG2, font=(FONT, 8, "bold"), anchor="w").pack(
-            fill="x", pady=(self.S(12), self.S(4)))
-
-    def _card(self, quiet=False):
-        tk = self.tk
-        outer = tk.Frame(self.frame, bg=BORDER)
-        outer.pack(fill="x", pady=(0, self.S(6)))
-        inner = tk.Frame(outer, bg=CARD_QUIET if quiet else CARD, padx=self.S(10), pady=self.S(8))
-        inner.pack(fill="x", padx=1, pady=1)
-        return inner
-
-    def _bar_row(self, parent, label, w, quiet=False, bg=CARD):
-        tk = self.tk
-        row = tk.Frame(parent, bg=bg)
-        row.pack(fill="x", pady=(self.S(3), 0))
-        tk.Label(row, text=label, bg=bg, fg=FG2, font=(FONT, 9), width=7, anchor="w").pack(side="left")
-        bar = self._img(make_bar(self.S(130), self.S(6), w["used"] if w else None, quiet))
-        tk.Label(row, image=bar, bg=bg, bd=0).pack(side="left", padx=(0, self.S(8)))
-        tk.Label(row, text=fmt_reset(w["resets"]) if w else "", bg=bg, fg=FG2, font=(FONT, 8), width=9, anchor="e").pack(side="right")
-        color = FG2 if not w else (FG if quiet else SEV_TEXT[severity(w["used"])] if w["used"] >= 70 else FG)
-        tk.Label(row, text=pct(w), bg=bg, fg=color, font=(FONT, 9, "bold"), width=4, anchor="e").pack(side="right")
-
-    def _claude_card(self, c):
-        tk = self.tk
-        bg = CARD_QUIET if c["quiet"] else CARD
-        card = self._card(c["quiet"])
-        top = tk.Frame(card, bg=bg)
-        top.pack(fill="x")
-        tk.Label(top, text=c["name"], bg=bg, fg=FG2 if c["quiet"] else FG, font=(FONT, 10, "bold")).pack(side="left")
-        if c["label"]:
-            tk.Label(top, text=c["label"], bg=bg, fg=FG2, font=(FONT, 8)).pack(side="left", padx=self.S(6))
-        if c["stale"]:
-            tk.Label(top, text="●", bg=bg, fg="#FB923C", font=(FONT, 8)).pack(side="right")
-        self._bar_row(card, "5 soat", c["five"], c["quiet"], bg)
-        self._bar_row(card, "Hafta", c["week"], c["quiet"], bg)
-        if c["error"] and (c["five"] is None or c["stale"]):
-            tk.Label(card, text=c["error"], bg=bg, fg="#FDBA74", font=(FONT, 8), anchor="w", justify="left",
-                     wraplength=self.S(self.WIDTH - 60)).pack(fill="x", pady=(self.S(4), 0))
-
-    def _agy_card(self, a):
-        tk = self.tk
-        card = self._card(not a["enabled"])
-        bg = CARD_QUIET if not a["enabled"] else CARD
-        top = tk.Frame(card, bg=bg, cursor="hand2")
-        top.pack(fill="x")
-        open_ = a["id"] in self.expanded
-        arrow = tk.Label(top, text=("▾ " if open_ else "▸ ") + a["id"].upper(), bg=bg, fg=FG if a["enabled"] else FG2,
-                         font=(FONT, 10, "bold"))
-        arrow.pack(side="left")
-        for wdg in (top, arrow):
-            wdg.bind("<Button-1>", lambda e, n=a["id"]: self._toggle_expand(n))
-
-        if not a["enabled"]:
-            tk.Label(top, text="o'chiq", bg=bg, fg=FG2, font=(FONT, 8)).pack(side="right")
+    def _click(self, e):
+        act, _ = self._hit(e.x, e.y)
+        if not act:
             return
-        if a["needsLogin"]:
-            b = tk.Label(top, text=" Kirish ", bg="#6366F1", fg="white", font=(FONT, 8, "bold"), cursor="hand2")
-            b.pack(side="right")
-            b.bind("<Button-1>", lambda e, n=a["id"]: self.store.sign_in_agy(n))
-            tk.Label(top, text="kirish kerak", bg=bg, fg="#FB923C", font=(FONT, 8)).pack(side="right", padx=self.S(6))
-            return
-
-        if not open_:   # collapsed: weekly used % per model group
-            for title, g in (("Claude&GPT", a["claude"]), ("Gemini", a["gemini"])):
-                w = g and g.get("week")
-                tk.Label(top, text=pct(w), bg=bg, fg=FG if not w or w["used"] < 70 else SEV_TEXT[severity(w["used"])],
-                         font=(FONT, 9, "bold"), width=4, anchor="e").pack(side="right")
-                tk.Label(top, text=title, bg=bg, fg=FG2, font=(FONT, 8)).pack(side="right", padx=(self.S(6), 0))
-        else:
-            for title, g in (("Gemini", a["gemini"]), ("Claude & GPT", a["claude"])):
-                tk.Label(card, text=title, bg=bg, fg=FG2, font=(FONT, 8, "bold"), anchor="w").pack(fill="x", pady=(self.S(5), 0))
-                self._bar_row(card, "5 soat", g and g.get("five"), bg=bg)
-                self._bar_row(card, "Hafta", g and g.get("week"), bg=bg)
-        if a["error"]:
-            tk.Label(card, text=a["error"], bg=bg, fg="#FDBA74", font=(FONT, 8), anchor="w", justify="left",
-                     wraplength=self.S(self.WIDTH - 60)).pack(fill="x", pady=(self.S(4), 0))
-        elif not a["fetched"]:
-            tk.Label(card, text="yuklanmoqda…", bg=bg, fg=FG2, font=(FONT, 8), anchor="w").pack(fill="x")
+        kind = act[0]
+        if kind == "refresh":
+            self.store.refresh(force=True)
+            self.render()
+        elif kind == "menu":
+            self._menu(e)
+        elif kind == "toggle":
+            self._toggle_expand(act[1])
+        elif kind == "signin":
+            self.store.sign_in_agy(act[1])
 
     def _toggle_expand(self, name):
         self.expanded ^= {name}
