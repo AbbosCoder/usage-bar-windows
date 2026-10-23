@@ -378,7 +378,7 @@ def fetch_agy(acct: dict, prior: dict | None, agy_bin: str | None) -> dict:
     if not agy_bin:
         rec["error"] = "agy topilmadi. O'rnating yoki config.json'da \"agyPath\" ni yozing."
         return rec
-    out, timed_out, err = run_capture([agy_bin, "-p", "/quota"], agy_env(acct), timeout=90)
+    out, timed_out, err = run_capture([agy_bin, "-p", "/quota"], agy_env(acct), timeout=45)
     if err:
         rec["error"] = err
         return rec
@@ -501,28 +501,73 @@ class CredStore:
 
 
 class CrossProcessLock:
-    """Only one process at a time may swap the agy login (the tray app and the agy-acc command)."""
+    """Only one process at a time may swap the agy login (the tray app and the agy-acc command).
+    Waits in short steps, so Ctrl+C works and a waiting command can say why it waits."""
+
+    NAME = "Local\\UsageBarAgyCredential"
 
     def __init__(self):
         self._t = threading.RLock()
         self._h = None
+        self._k32 = None
+
+    def _kernel32(self):
+        if self._k32 is None:
+            import ctypes
+            from ctypes import wintypes as wt
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            k.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
+            k.CreateMutexW.restype = wt.HANDLE
+            k.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+            k.WaitForSingleObject.restype = wt.DWORD
+            k.ReleaseMutex.argtypes = [wt.HANDLE]
+            k.CloseHandle.argtypes = [wt.HANDLE]
+            self._k32 = k
+        return self._k32
+
+    def acquire(self, wait=True, notice=None, limit=300) -> bool:
+        self._t.acquire()
+        if not IS_WIN:
+            return True
+        k = self._kernel32()
+        h = k.CreateMutexW(None, False, self.NAME)
+        r = k.WaitForSingleObject(h, 0)
+        if r == 0x102:   # WAIT_TIMEOUT: someone else is swapping right now
+            if not wait:
+                k.CloseHandle(h)
+                self._t.release()
+                return False
+            if notice:
+                print(notice, flush=True)
+            deadline = time.time() + limit
+            try:
+                while r == 0x102 and time.time() < deadline:
+                    r = k.WaitForSingleObject(h, 250)
+            except BaseException:
+                k.CloseHandle(h)
+                self._t.release()
+                raise
+            if r == 0x102:
+                k.CloseHandle(h)
+                self._t.release()
+                raise TimeoutError("agy login band (boshqa jarayon ishlatyapti)")
+        self._h = h
+        return True
+
+    def release(self):
+        if IS_WIN and self._h:
+            k = self._kernel32()
+            k.ReleaseMutex(self._h)
+            k.CloseHandle(self._h)
+            self._h = None
+        self._t.release()
 
     def __enter__(self):
-        self._t.acquire()
-        if IS_WIN:
-            import ctypes
-            k32 = ctypes.windll.kernel32
-            self._h = k32.CreateMutexW(None, False, "Local\\UsageBarAgyCredential")
-            k32.WaitForSingleObject(self._h, 120_000)
+        self.acquire()
         return self
 
     def __exit__(self, *exc):
-        if IS_WIN and self._h:
-            import ctypes
-            ctypes.windll.kernel32.ReleaseMutex(self._h)
-            ctypes.windll.kernel32.CloseHandle(self._h)
-            self._h = None
-        self._t.release()
+        self.release()
 
 
 CRED_LOCK = CrossProcessLock()
@@ -763,14 +808,17 @@ def cmd_acc(args: list[str]) -> int:
         print("Nom faqat harf, raqam va . _ - @ + belgilaridan iborat bo'lsin.")
         return 1
 
-    with CRED_LOCK:
-        acc.recover()
-        acc.sync_active()
+    if op in ("list", "current"):   # read-only: never wait for the tray
+        if CRED_LOCK.acquire(wait=False):
+            try:
+                acc.recover()
+                acc.sync_active()
+            finally:
+                CRED_LOCK.release()
         cur = acc.current()
         active = acc.matching(cur)
         names = acc.names()
-
-        if op in ("list", "current"):
+        if True:
             who = active
             if op == "current":
                 print(who or ("(saqlanmagan akkaunt)" if cur else "(hech kim kirmagan)"))
@@ -786,6 +834,25 @@ def cmd_acc(args: list[str]) -> int:
             if cur and not who:
                 print("\nagy'da hozir saqlanmagan akkaunt bor. Saqlash:  agy-acc save NOM")
             return 0
+
+    try:
+        CRED_LOCK.acquire(notice="Tray dasturi hozir agy kvotasini tekshiryapti — tugashini kutyapman (Ctrl+C — bekor qilish)…")
+    except TimeoutError as e:
+        print(e)
+        return 1
+    try:
+        acc.recover()
+        acc.sync_active()
+        cur = acc.current()
+        active = acc.matching(cur)
+        names = acc.names()
+        return _acc_change(op, name, args, force, acc, cfg, cur, active, names)
+    finally:
+        CRED_LOCK.release()
+
+
+def _acc_change(op, name, args, force, acc, cfg, cur, active, names) -> int:
+    if True:
 
         if op == "save":
             if not cur:
