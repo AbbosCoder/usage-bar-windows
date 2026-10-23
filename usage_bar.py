@@ -7,7 +7,7 @@ macOS'dagi "usage-bar" (Swift) dasturining Windows uchun Python porti.
 
 Ishga tushirish:   pythonw usage_bar.py
 Tekshirish:        python usage_bar.py --check
-agy akkaunt qo'sh: python usage_bar.py --add-agy [nomi]
+Gmail akkauntlar: agy-acc (= python usage_bar.py acc ...), qo'llanma: AGY_AKKAUNTLAR.md
 
 Hech qanday token diskka yoki logga yozilmaydi. Tarmoq: faqat api.anthropic.com (o'zingizning tokeningiz bilan).
 """
@@ -70,6 +70,7 @@ def normalize_config(raw: dict) -> dict:
         "menuBarAccount": raw.get("menuBarAccount"),
         "trayIcon": raw.get("trayIcon") or "number",
         "agyPath": raw.get("agyPath"),
+        "agyCredential": raw.get("agyCredential") or None,
         "claude": [],
         "agy": [],
         "quotaFile": raw.get("quotaFile"),
@@ -103,6 +104,7 @@ def save_config(cfg: dict) -> None:
         "menuBarAccount": cfg.get("menuBarAccount"),
         "trayIcon": cfg.get("trayIcon", "number"),
         "agyPath": cfg.get("agyPath"),
+        **({"agyCredential": cfg["agyCredential"]} if cfg.get("agyCredential") else {}),
         "claude": [{k: v for k, v in c.items() if v is not None} for c in cfg["claude"]],
         "agy": [{k: v for k, v in a.items() if v is not None} for a in cfg["agy"]],
         "quotaFile": cfg.get("quotaFile"),
@@ -134,12 +136,21 @@ def autodetect() -> dict:
         cfg["claude"].append({"name": name, "label": None, "configDir": "~/" + d.name})
     cfg["menuBarAccount"] = cfg["claude"][0]["name"] if cfg["claude"] else None
 
-    if find_agy(cfg):
-        cfg["agy"].append({"name": "agy", "home": None, "enabled": True, "env": None})
-    if AGY_ACCOUNTS_DIR.is_dir():
+    if find_agy(cfg):   # on Windows this account takes over the login agy already has (see agy-acc)
+        cfg["agy"].append({"name": "gmail1" if swap_mode_available() else "agy", "home": None, "enabled": True, "env": None})
+    if AGY_ACCOUNTS_DIR.is_dir() and not swap_mode_available():
         for d in sorted(p for p in AGY_ACCOUNTS_DIR.iterdir() if p.is_dir()):
             cfg["agy"].append({"name": d.name, "home": "~/.agy-accounts/" + d.name, "enabled": True, "env": None})
     return cfg
+
+
+def swap_mode_available() -> bool:
+    return IS_WIN or bool(os.environ.get("USAGE_BAR_FAKE_CREDS"))
+
+
+def is_swap_account(a: dict) -> bool:
+    """On Windows every agy account without a "home" is a saved login (see "credential swap" below)."""
+    return swap_mode_available() and not a.get("home")
 
 
 # ───────────────────────────── finding binaries ─────────────────────────────
@@ -384,6 +395,472 @@ def fetch_agy(acct: dict, prior: dict | None, agy_bin: str | None) -> dict:
     return rec
 
 
+# ───────────────────────────── agy accounts on Windows (credential swap) ─────────────────────────────
+#
+# On Windows agy (and the Antigravity desktop app) keep ONE Google login in Credential Manager, generic
+# credential "gemini:antigravity" — a different HOME does not give a different account. So every account's
+# login is saved into its own Credential Manager item ("usage-bar/agy/<name>", still protected by Windows),
+# and swapped into "gemini:antigravity" when that account is needed. Never use /logout inside agy for a saved
+# account: it can revoke the refresh token. "acc new" only clears the local login.
+
+SLOT_PREFIX = "usage-bar/agy/"
+BACKUP_SLOT = "usage-bar/agy-backup"
+STATE_PATH = CACHE_PATH.parent / "agy-accounts.json"
+
+
+class CredStore:
+    """Generic credentials: {"type", "user", "blob": bytes, "persist"}. Windows Credential Manager, or a JSON
+    file when USAGE_BAR_FAKE_CREDS is set (tests on other systems)."""
+
+    def __init__(self):
+        self.fake = os.environ.get("USAGE_BAR_FAKE_CREDS")
+        if not self.fake and IS_WIN:
+            self._init_win()
+
+    @property
+    def available(self) -> bool:
+        return bool(self.fake) or IS_WIN
+
+    def _init_win(self):
+        import ctypes
+        from ctypes import wintypes as wt
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [("lo", wt.DWORD), ("hi", wt.DWORD)]
+
+        class CREDENTIALW(ctypes.Structure):
+            _fields_ = [("Flags", wt.DWORD), ("Type", wt.DWORD), ("TargetName", wt.LPWSTR), ("Comment", wt.LPWSTR),
+                        ("LastWritten", FILETIME), ("CredentialBlobSize", wt.DWORD),
+                        ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)), ("Persist", wt.DWORD),
+                        ("AttributeCount", wt.DWORD), ("Attributes", ctypes.c_void_p), ("TargetAlias", wt.LPWSTR),
+                        ("UserName", wt.LPWSTR)]
+
+        adv = ctypes.WinDLL("advapi32", use_last_error=True)
+        PC = ctypes.POINTER(CREDENTIALW)
+        adv.CredReadW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.POINTER(PC)]
+        adv.CredReadW.restype = wt.BOOL
+        adv.CredWriteW.argtypes = [PC, wt.DWORD]
+        adv.CredWriteW.restype = wt.BOOL
+        adv.CredDeleteW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD]
+        adv.CredDeleteW.restype = wt.BOOL
+        adv.CredFree.argtypes = [ctypes.c_void_p]
+        self._ct, self._adv, self._C, self._PC = ctypes, adv, CREDENTIALW, PC
+
+    def _fake_all(self) -> dict:
+        try:
+            return json.loads(Path(self.fake).read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def read(self, target: str) -> dict | None:
+        if self.fake:
+            c = self._fake_all().get(target)
+            return None if c is None else {"type": 1, "user": c.get("user"), "blob": c["blob"].encode("latin-1"), "persist": 2}
+        if not IS_WIN:
+            return None
+        ct = self._ct
+        p = self._PC()
+        if not self._adv.CredReadW(target, 1, 0, ct.byref(p)):   # CRED_TYPE_GENERIC
+            return None
+        try:
+            c = p.contents
+            return {"type": c.Type, "user": c.UserName, "persist": c.Persist or 2,
+                    "blob": ct.string_at(c.CredentialBlob, c.CredentialBlobSize) if c.CredentialBlobSize else b""}
+        finally:
+            self._adv.CredFree(p)
+
+    def write(self, target: str, cred: dict, comment: str | None = None) -> None:
+        if self.fake:
+            allc = self._fake_all()
+            allc[target] = {"user": cred.get("user"), "blob": cred["blob"].decode("latin-1")}
+            Path(self.fake).write_text(json.dumps(allc), encoding="utf-8")
+            return
+        ct = self._ct
+        blob = cred["blob"]
+        buf = (ct.c_ubyte * max(len(blob), 1)).from_buffer_copy(blob or b"\0")
+        c = self._C()
+        c.Type = 1
+        c.TargetName = target
+        c.Comment = comment
+        c.CredentialBlobSize = len(blob)
+        c.CredentialBlob = ct.cast(buf, ct.POINTER(ct.c_ubyte))
+        c.Persist = cred.get("persist") or 2   # CRED_PERSIST_LOCAL_MACHINE
+        c.UserName = cred.get("user")
+        if not self._adv.CredWriteW(ct.byref(c), 0):
+            raise OSError(f"CredWrite({target}) xatosi {ct.get_last_error()}")
+
+    def delete(self, target: str) -> None:
+        if self.fake:
+            allc = self._fake_all()
+            allc.pop(target, None)
+            Path(self.fake).write_text(json.dumps(allc), encoding="utf-8")
+        elif IS_WIN:
+            self._adv.CredDeleteW(target, 1, 0)
+
+
+class CrossProcessLock:
+    """Only one process at a time may swap the agy login (the tray app and the agy-acc command)."""
+
+    def __init__(self):
+        self._t = threading.RLock()
+        self._h = None
+
+    def __enter__(self):
+        self._t.acquire()
+        if IS_WIN:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            self._h = k32.CreateMutexW(None, False, "Local\\UsageBarAgyCredential")
+            k32.WaitForSingleObject(self._h, 120_000)
+        return self
+
+    def __exit__(self, *exc):
+        if IS_WIN and self._h:
+            import ctypes
+            ctypes.windll.kernel32.ReleaseMutex(self._h)
+            ctypes.windll.kernel32.CloseHandle(self._h)
+            self._h = None
+        self._t.release()
+
+
+CRED_LOCK = CrossProcessLock()
+
+
+JWT = re.compile(r"eyJ[\w-]+\.(eyJ[\w-]+)\.[\w-]*")
+
+
+def cred_identity(cred: dict | None) -> str | None:
+    """Google account e-mail (or subject) from the id_token inside agy's saved login, if it can be read."""
+    if not cred or not cred.get("blob"):
+        return None
+    import base64
+    b = cred["blob"]
+    texts = [b.decode("utf-8", "ignore")]
+    if b.count(b"\0") > len(b) // 4:
+        texts.append(b.decode("utf-16-le", "ignore"))
+    for t in texts:
+        for m in JWT.finditer(t):
+            seg = m.group(1)
+            try:
+                payload = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+            except Exception:
+                continue
+            ident = payload.get("email") or payload.get("sub")
+            if ident:
+                return str(ident)
+        m = re.search(r'"email"\s*:\s*"([^"]+@[^"]+)"', t)
+        if m:
+            return m.group(1)
+    return None
+
+
+def same_login(a: dict | None, b: dict | None) -> bool:
+    if not a or not b:
+        return False
+    if a["blob"] == b["blob"]:
+        return True
+    ia, ib = cred_identity(a), cred_identity(b)
+    return bool(ia and ia == ib)
+
+
+class AgyAccounts:
+    """Saved agy logins and which one is active in "gemini:antigravity"."""
+
+    def __init__(self, cfg: dict):
+        self.target = cfg.get("agyCredential") or "gemini:antigravity"
+        self.cs = CredStore()
+
+    # state: which saved account is currently in the shared credential
+    def active(self) -> str | None:
+        try:
+            return json.loads(STATE_PATH.read_text(encoding="utf-8")).get("active")
+        except Exception:
+            return None
+
+    def set_active(self, name: str | None) -> None:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STATE_PATH.write_text(json.dumps({"active": name}), encoding="utf-8")
+
+    def has(self, name: str) -> bool:
+        return self.cs.read(SLOT_PREFIX + name) is not None
+
+    def current(self) -> dict | None:
+        return self.cs.read(self.target)
+
+    def save_slot(self, name: str, cred: dict) -> None:
+        self.cs.write(SLOT_PREFIX + name, cred, f"usage-bar: agy account {name}")
+
+    def matching(self, cred: dict | None) -> str | None:
+        """Name of the saved account whose login is exactly `cred` (None if unknown)."""
+        if not cred:
+            return None
+        for n in self.names():
+            if same_login(self.cs.read(SLOT_PREFIX + n), cred):
+                return n
+        return None
+
+    def names(self) -> list[str]:
+        cfg, _ = load_config()
+        return [a["name"] for a in cfg["agy"] if not a.get("home")]
+
+    def recover(self) -> None:
+        """A crash in the middle of a swap leaves the user's login in the backup item: put it back."""
+        b = self.cs.read(BACKUP_SLOT)
+        if b is not None:
+            if b["blob"] == b"<none>":
+                self.cs.delete(self.target)
+            else:
+                self.cs.write(self.target, b)
+            self.cs.delete(BACKUP_SLOT)
+
+    def sync_active(self) -> None:
+        """agy refreshes its token now and then: keep the active account's saved copy current."""
+        cur = self.current()
+        who = self.matching(cur)
+        if who:   # only when the current login is provably that account (never overwrite with someone else)
+            self.save_slot(who, cur)
+            self.set_active(who)
+
+    def swap_in(self, name: str) -> dict | None:
+        """Puts `name` into the shared credential; returns what was there (to restore with swap_out)."""
+        prev = self.current()
+        self.cs.write(BACKUP_SLOT, prev or {"type": 1, "user": None, "blob": b"<none>", "persist": 2})
+        self.cs.write(self.target, self.cs.read(SLOT_PREFIX + name))
+        return prev
+
+    def swap_out(self, name: str, prev: dict | None) -> None:
+        """Saves `name`'s (possibly refreshed) login back to its slot and restores the previous one."""
+        now = self.current()
+        if now and (same_login(now, self.cs.read(SLOT_PREFIX + name)) or not cred_identity(now)):
+            self.save_slot(name, now)
+        if prev:
+            self.cs.write(self.target, prev)
+        else:
+            self.cs.delete(self.target)
+        self.cs.delete(BACKUP_SLOT)
+
+
+def agy_running() -> bool:
+    """agy or the Antigravity desktop app is open: they hold the login in memory and write it back on refresh."""
+    if not IS_WIN:
+        return bool(os.environ.get("USAGE_BAR_FAKE_AGY_RUNNING"))
+    try:
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=10,
+                             creationflags=CREATE_NO_WINDOW).stdout.lower()
+    except Exception:
+        return False
+    return any(f'"{n}"' in out for n in ("agy.exe", "antigravity.exe"))
+
+
+def fetch_agy_swapped(accounts: list[dict], priors: dict, agy_bin: str | None, cfg: dict) -> dict:
+    """Quota for saved (credential-swap) accounts, one after another. Accounts other than the active one are
+    skipped while agy / Antigravity is open, so a running session is never disturbed."""
+    out = {}
+    acc = AgyAccounts(cfg)
+    with CRED_LOCK:
+        acc.recover()
+        acc.sync_active()
+        active = acc.matching(acc.current())
+        busy = None
+        for a in accounts:
+            n = a["name"]
+            prior = priors.get(n.lower())
+            cur = acc.current()
+            if not acc.has(n) and cur and not acc.matching(cur):
+                acc.save_slot(n, cur)   # first run: the login agy already has belongs to this account
+                acc.set_active(n)
+                active = n
+            if not acc.has(n):
+                rec = dict(prior or {})
+                rec.update(source=None, lastAttempt=time.time(), needsLogin=True,
+                           error=None)
+                out[n.lower()] = rec
+                continue
+            if n == active:
+                out[n.lower()] = fetch_agy(a, prior, agy_bin)
+                acc.sync_active()
+                continue
+            if busy is None:
+                busy = agy_running()
+            if busy:
+                rec = dict(prior or {})
+                rec.update(source=None, lastAttempt=time.time() - 9 * 60,   # try again in about a minute
+                           error="agy / Antigravity ochiq — bu akkaunt ular yopilganda yangilanadi.")
+                out[n.lower()] = rec
+                continue
+            prev = acc.swap_in(n)
+            try:
+                out[n.lower()] = fetch_agy(a, prior, agy_bin)
+            finally:
+                acc.swap_out(n, prev)
+    return out
+
+
+def python_console_exe() -> str:
+    exe = sys.executable
+    if exe.lower().endswith("pythonw.exe"):
+        c = exe[:-len("pythonw.exe")] + "python.exe"
+        if os.path.exists(c):
+            return c
+    return exe
+
+
+# ───────────────────────────── agy-acc command line ─────────────────────────────
+
+ACC_HELP = """\
+agy-acc — bir nechta Google (gmail) akkauntni agy uchun boshqarish
+
+  agy-acc list              saqlangan akkauntlar (* = hozir agy ishlatayotgani)
+  agy-acc save NOM          hozir agy'da kirilgan akkauntni NOM nomi bilan saqlash
+  agy-acc add NOM           yangi gmail qo'shish: agy ochiladi, kirasiz, /quit — avtomatik saqlanadi
+  agy-acc use NOM           agy (va Antigravity) uchun NOM akkauntiga o'tish
+  agy-acc login NOM         NOM akkauntiga qayta kirish (token eskirgan bo'lsa)
+  agy-acc remove NOM        saqlangan akkauntni o'chirish
+  agy-acc current           hozirgi akkaunt
+
+  --force                   agy ochiq bo'lsa ham bajarish (tavsiya etilmaydi)
+
+Eslatma: saqlangan akkaunt uchun agy ichida /logout QILMANG — token bekor bo'lib qolishi mumkin.
+"""
+
+
+def _ensure_config_account(name: str) -> None:
+    cfg, err = load_config()
+    if err:
+        return
+    if not any(a["name"].lower() == name.lower() for a in cfg["agy"]):
+        cfg["agy"].append({"name": name, "home": None, "enabled": True, "env": None})
+        save_config(cfg)
+
+
+def _run_agy_interactive(cfg: dict) -> int:
+    agy = find_agy(cfg)
+    if not agy:
+        print("agy topilmadi. O'rnating yoki config.json'da \"agyPath\" ni yozing.")
+        return 1
+    return subprocess.call([agy], cwd=tempfile.gettempdir())
+
+
+def cmd_acc(args: list[str]) -> int:
+    force = "--force" in args
+    args = [a for a in args if a != "--force"]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(ACC_HELP)
+        return 0
+    cfg, _ = load_config()
+    acc = AgyAccounts(cfg)
+    if not acc.cs.available:
+        print("Bu buyruq faqat Windows uchun (agy logini Credential Manager'da).")
+        return 1
+    op, name = args[0], (args[1] if len(args) > 1 else None)
+    if op in ("save", "add", "use", "login", "remove") and not name:
+        print(f"Nom kerak:  agy-acc {op} NOM")
+        return 1
+    if name and not re.fullmatch(r"[\w.@+-]{1,40}", name):
+        print("Nom faqat harf, raqam va . _ - @ + belgilaridan iborat bo'lsin.")
+        return 1
+
+    with CRED_LOCK:
+        acc.recover()
+        acc.sync_active()
+        cur = acc.current()
+        active = acc.matching(cur)
+        names = acc.names()
+
+        if op in ("list", "current"):
+            who = active
+            if op == "current":
+                print(who or ("(saqlanmagan akkaunt)" if cur else "(hech kim kirmagan)"))
+                return 0
+            if not names:
+                print("Saqlangan akkaunt yo'q. Boshlash:  agy-acc save NOM  (hozirgi login)  yoki  agy-acc add NOM")
+            for n in names:
+                mark = "*" if n == who else " "
+                slot = acc.cs.read(SLOT_PREFIX + n)
+                email = cred_identity(slot)
+                print(f" {mark} {n:<12}" + (f" {email}" if email else "")
+                      + ("" if slot else "   (login saqlanmagan — agy-acc login " + n + ")"))
+            if cur and not who:
+                print("\nagy'da hozir saqlanmagan akkaunt bor. Saqlash:  agy-acc save NOM")
+            return 0
+
+        if op == "save":
+            if not cur:
+                print("agy'da hech kim kirmagan. Avval `agy` ni oching, Google bilan kiring, /quit — so'ng qayta urinib ko'ring.")
+                return 1
+            other = acc.matching(cur)
+            if other and other != name and not force:
+                print(f"Bu login allaqachon '{other}' nomi bilan saqlangan.")
+                return 1
+            acc.save_slot(name, cur)
+            acc.set_active(name)
+            _ensure_config_account(name)
+            email = cred_identity(cur)
+            print(f"Saqlandi: {name}" + (f" ({email})" if email else "") + " — hozir faol")
+            return 0
+
+        if op == "remove":
+            acc.cs.delete(SLOT_PREFIX + name)
+            if active == name:
+                acc.set_active(None)
+            cfg2, err = load_config()
+            if not err:
+                cfg2["agy"] = [a for a in cfg2["agy"] if a["name"] != name]
+                save_config(cfg2)
+            print(f"O'chirildi: {name}  (agy'dagi hozirgi login o'zgarmadi)")
+            return 0
+
+        running = agy_running()
+        if running and not force:
+            print("agy yoki Antigravity ilovasi ochiq. Avval ularni yoping (agy'da /quit), so'ng qayta urinib ko'ring.")
+            return 1
+        if cur and not active and not force:
+            print("agy'dagi hozirgi login hech qayerda saqlanmagan — yo'qolmasligi uchun avval uni saqlang:\n"
+                  "  agy-acc save NOM\n(yoki --force bilan davom eting)")
+            return 1
+
+        if op == "use":
+            if not acc.has(name):
+                print(f"'{name}' saqlanmagan. Ro'yxat: agy-acc list")
+                return 1
+            acc.cs.write(acc.target, acc.cs.read(SLOT_PREFIX + name))
+            acc.set_active(name)
+            _ensure_config_account(name)
+            print(f"Endi agy '{name}' akkauntidan foydalanadi. (Antigravity ilovasi ham shu akkauntda bo'ladi.)")
+            return 0
+
+        if op in ("add", "login"):
+            if op == "add" and acc.has(name):
+                print(f"'{name}' allaqachon bor. Qayta kirish uchun:  agy-acc login {name}")
+                return 1
+            prev_name = active
+            acc.cs.write(BACKUP_SLOT, cur or {"type": 1, "user": None, "blob": b"<none>", "persist": 2})
+            acc.cs.delete(acc.target)   # local logout only: the saved tokens stay valid
+            print(f"\n>>> agy ochilmoqda. '{name}' uchun Google akkaunt bilan kiring, so'ng /quit yozing.\n")
+            _run_agy_interactive(cfg)
+            new = acc.current()
+            if not new:
+                print("Kirilmadi — hech narsa o'zgarmadi.")
+                acc.recover()
+                return 1
+            dup = acc.matching(new)
+            if dup and dup != name:
+                print(f"Bu gmail allaqachon '{dup}' nomi bilan saqlangan — boshqa Google akkaunt bilan kiring.")
+                acc.recover()
+                return 1
+            acc.save_slot(name, new)
+            acc.cs.delete(BACKUP_SLOT)
+            acc.set_active(name)
+            _ensure_config_account(name)
+            email = cred_identity(new)
+            print(f"\nSaqlandi: {name}" + (f" ({email})" if email else "") + " — hozir faol." + (f"  Avvalgisiga qaytish: agy-acc use {prev_name}" if prev_name and prev_name != name else ""))
+            return 0
+
+    print(f"Noma'lum buyruq: {op}\n")
+    print(ACC_HELP)
+    return 1
+
+
 # ───────────────────────────── quotaFile (optional) ─────────────────────────────
 
 def read_quota_file(path: str) -> dict | None:
@@ -426,6 +903,7 @@ class Store:
         self.lock = threading.RLock()
         self.cache = load_cache()
         self.config, self.problem = load_config()
+        self._mtime = self.config_mtime()
         self.refreshing = False
         self.view: dict = {}
         self.load()
@@ -544,9 +1022,14 @@ class Store:
             try:
                 with ThreadPoolExecutor(max_workers=6) as ex:
                     fc = {a["name"].lower(): ex.submit(fetch_claude, a, prior_c.get(a["name"].lower())) for a in cj}
-                    fa = {a["name"].lower(): ex.submit(fetch_agy, a, prior_a.get(a["name"].lower()), agy_bin) for a in aj}
+                    fa = {a["name"].lower(): ex.submit(fetch_agy, a, prior_a.get(a["name"].lower()), agy_bin)
+                          for a in aj if not is_swap_account(a)}
+                    swapped = [a for a in aj if is_swap_account(a)]
+                    fs = ex.submit(fetch_agy_swapped, swapped, prior_a, agy_bin, self.config) if swapped else None
                     res_c = {k: f.result() for k, f in fc.items()}
                     res_a = {k: f.result() for k, f in fa.items()}
+                    if fs:
+                        res_a.update(fs.result())
                 with self.lock:
                     self.cache["claude"].update(res_c)
                     self.cache["agy"].update(res_a)
@@ -563,7 +1046,20 @@ class Store:
             t.join()
 
     # config actions
+    def config_mtime(self):
+        try:
+            return CONFIG_PATH.stat().st_mtime
+        except OSError:
+            return None
+
+    def reload_if_changed(self):
+        m = self.config_mtime()
+        if m != getattr(self, "_mtime", m):
+            self.reload_config()
+        self._mtime = m
+
     def reload_config(self):
+        self._mtime = self.config_mtime()
         self.config, self.problem = load_config()
         self.load()
         self.refresh(force=True)
@@ -595,9 +1091,13 @@ class Store:
         self.load()
         return acct
 
-    def sign_in_agy(self, name):
+    def sign_in_agy(self, name, new=False):
         a = next((a for a in self.config["agy"] if a["name"] == name), None)
-        if a:
+        if new or (a and is_swap_account(a)):
+            op = "add" if new else "login"
+            open_console([python_console_exe(), os.path.abspath(__file__), "acc", op, name], dict(os.environ),
+                         f"agy-acc {op} {name}")
+        elif a:
             open_console([find_agy(self.config) or "agy"], agy_env(a), f"agy — {name}: Google akkaunt bilan kiring, keyin /quit")
 
     def start_claude(self, name):
@@ -858,6 +1358,8 @@ class App:
         self.q = queue.Queue()
         self.root = tk.Tk()
         self.root.withdraw()
+        if hasattr(setup_logging, "hook"):
+            self.root.report_callback_exception = setup_logging.hook
         self.scale = self.root.winfo_fpixels("1i") / 96.0
         self.images = []
         self.expanded: set[str] = set()
@@ -883,7 +1385,7 @@ class App:
         try:
             import pystray
         except Exception as e:
-            print("pystray ishlamadi:", e)
+            notify(f"Tray ikonka ishga tushmadi (pystray): {e}")
             return
         M = pystray.MenuItem
         menu = pystray.Menu(
@@ -956,6 +1458,7 @@ class App:
         self.root.after(10_000, self._tick10)
 
     def _tick60(self):
+        self.store.reload_if_changed()   # e.g. agy-acc added an account
         self.store.refresh()   # every account has its own minimum interval
         self.root.after(60_000, self._tick60)
 
@@ -1165,6 +1668,12 @@ class App:
         agy.add_separator()
         for a in self.store.config["agy"]:
             agy.add_command(label=f"Kirish: {a['name']}…", command=lambda n=a["name"]: self.store.sign_in_agy(n))
+        if swap_mode_available():
+            agy.add_separator()
+            for a in self.store.config["agy"]:
+                if is_swap_account(a):
+                    agy.add_command(label=f"Terminal/agy uchun tanlash: {a['name']}", command=lambda n=a["name"]: open_console(
+                        [python_console_exe(), os.path.abspath(__file__), "acc", "use", n], dict(os.environ), f"agy-acc use {n}"))
         agy.add_separator()
         agy.add_command(label="Yangi agy akkaunt qo'shish…", command=self.add_agy)
         m.add_cascade(label="agy akkauntlar", menu=agy)
@@ -1201,9 +1710,22 @@ class App:
         self.render()
 
     def add_agy(self):
-        acct = self.store.add_agy_account()
-        self.store.sign_in_agy(acct["name"])
-        self.q.put(("changed",))
+        if not swap_mode_available():
+            acct = self.store.add_agy_account()
+            self.store.sign_in_agy(acct["name"])
+            self.q.put(("changed",))
+            return
+        from tkinter import simpledialog
+        taken = {a["name"].lower() for a in self.store.config["agy"]}
+        i = 1
+        while f"gmail{i}" in taken:
+            i += 1
+        self.menu_open = True
+        name = simpledialog.askstring("agy akkaunt qo'shish", "Yangi akkaunt nomi (masalan gmail2):",
+                                      initialvalue=f"gmail{i}", parent=self.root)
+        self.root.after(300, self._menu_closed)
+        if name and re.fullmatch(r"[\w.@+-]{1,40}", name.strip()):
+            self.store.sign_in_agy(name.strip(), new=True)
 
     def quit(self):
         if self.icon:
@@ -1221,7 +1743,9 @@ def cmd_check():
     s.refresh(force=True, wait=True)
     s.load()
     v = s.view
+    print(f"python: {sys.executable} ({sys.version.split()[0]})")
     print(f"config: {CONFIG_PATH}")
+    print(f"log:    {LOG_PATH}")
     print(f"agy:    {find_agy(s.config) or 'TOPILMADI'}")
     for c in v["claude"]:
         print(f"claude {c['id']}: 5h={pct(c['five'])} week={pct(c['week'])}" + (f"  error={c['error']}" if c["error"] else ""))
@@ -1235,18 +1759,87 @@ def main(argv):
     if "--check" in argv:
         cmd_check()
         return
+    if argv and argv[0] == "acc":
+        sys.exit(cmd_acc(argv[1:]))
     if "--add-agy" in argv:
         i = argv.index("--add-agy")
         name = argv[i + 1] if i + 1 < len(argv) and not argv[i + 1].startswith("-") else None
+        if swap_mode_available():
+            sys.exit(cmd_acc(["add", name or "gmail2"]))
         s = Store()
         acct = s.add_agy_account(name)
         print(f"Qo'shildi: {acct['name']}  (HOME = {expand(acct['home'])})")
         print("Yangi oynada agy ochiladi: boshqa Google akkaunt bilan kiring, so'ng /quit yozing.")
         s.sign_in_agy(acct["name"])
         return
+    log = setup_logging()
+    if not deps_ok():
+        sys.exit(1)
     if not single_instance():
+        notify("Usage allaqachon ishlayapti — ikonka soat yonida (^ strelka ichida bo'lishi mumkin).\n"
+               "Qayta ishga tushirish uchun: ikonka → o'ng tugma → Chiqish, so'ng yana ishga tushiring.")
         return
+    print("Usage ishga tushdi. Ikonka soat yonida (ko'rinmasa — ^ strelka ichida).", flush=True)
+    print(f"Log fayl: {log}", flush=True)
+    print("Bu oynani yopsangiz dastur ham yopiladi. Fon rejimida ishlatish: start.bat", flush=True)
     App(show="--show" in argv).run()
+
+
+LOG_PATH = CACHE_PATH.parent / "usage-bar.log"
+
+
+def setup_logging() -> Path:
+    """Errors (and native crashes) go to usage-bar.log; under pythonw there is no console at all."""
+    import faulthandler
+    import traceback
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    f = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
+    f.write(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S} start · Python {sys.version.split()[0]} · {sys.executable}\n")
+    faulthandler.enable(f)
+    if sys.stderr is None:   # pythonw
+        sys.stderr = f
+    if sys.stdout is None:
+        sys.stdout = f
+
+    def hook(t, v, tb):
+        text = "".join(traceback.format_exception(t, v, tb))
+        f.write(text)
+        if sys.stderr is not f:
+            sys.stderr.write(text)
+    sys.excepthook = hook
+    threading.excepthook = lambda a: hook(a.exc_type, a.exc_value, a.exc_traceback)
+    setup_logging.hook = hook
+    return LOG_PATH
+
+
+def notify(msg: str) -> None:
+    """Prints, and also shows a message box when there is no console (pythonw)."""
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
+    if IS_WIN and (sys.stdout is None or not getattr(sys.stdout, "isatty", lambda: False)()):
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, msg, "Usage", 0x40)
+        except Exception:
+            pass
+
+
+def deps_ok() -> bool:
+    import importlib.util
+    missing = [pkg for mod, pkg in (("PIL", "pillow"), ("pystray", "pystray")) if importlib.util.find_spec(mod) is None]
+    no_tk = importlib.util.find_spec("tkinter") is None
+    if not missing and not no_tk:
+        return True
+    lines = []
+    if missing:
+        lines.append(f"Kerakli kutubxonalar o'rnatilmagan: {', '.join(missing)}.\nShu buyruqni terminalda ishga tushiring:\n\n"
+                     f'  & "{sys.executable}" -m pip install {" ".join(missing)}\n')
+    if no_tk:
+        lines.append("Bu Python'da tkinter yo'q. python.org dan Python o'rnating (\"tcl/tk and IDLE\" belgilangan bo'lsin).")
+    notify("\n".join(lines))
+    return False
 
 
 if __name__ == "__main__":

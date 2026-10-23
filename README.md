@@ -24,36 +24,22 @@ Asl macOS dasturi ([usage-bar](https://github.com/thexayotbe/usage-bar)) ning Wi
 3. Soat yonida halqa ikonka paydo bo'ladi (ko'rinmasa — `^` strelka ichida; uni sudrab tashqariga chiqaring).
 4. Windows bilan birga ochilishi uchun: oynada **`•••` → "Windows bilan birga ishga tushirish"**.
 
-Keyingi safar ishga tushirish: **`start.bat`**.
+Keyingi safar ishga tushirish: **`start.bat`**. `install.bat` papkani PATH'ga ham qo'shadi, shuning uchun terminalda `agy-acc` buyrug'i ishlaydi.
 
-## 3 ta Gemini (agy) akkauntni ulash
+## Bir nechta Gmail (agy) akkauntni ulash
 
-`agy` login ma'lumotini foydalanuvchi papkasida (`HOME` / `USERPROFILE`) saqlaydi. Shuning uchun har bir qo'shimcha akkaunt —
-alohida "uy papkasi": `C:\Users\<siz>\.agy-accounts\agy2`, `...\agy3`. Dastur `agy` ni shu papka bilan ishga tushiradi.
+Windows'da `agy` bitta umumiy loginni ishlatadi (Credential Manager → `gemini:antigravity`). Shuning uchun har bir gmail
+loginini saqlab qo'yib, kerak bo'lganda almashtiradigan **`agy-acc`** buyrug'i bor. Qisqasi (yangi terminalda):
 
-1. **1-akkaunt** — oddiy `agy`. Agar hali kirmagan bo'lsangiz, terminalda `agy` ni ochib Google akkaunt bilan kiring, keyin `/quit`.
-2. **2-akkaunt** — `agy_akkaunt_qoshish.bat` ni ishga tushiring, nomini bo'sh qoldiring (→ `agy2`).
-   Yangi qora oyna ochiladi: **ikkinchi** Google akkaunt bilan kiring, keyin `/quit` yozib oynani yoping.
-3. **3-akkaunt** — yana `agy_akkaunt_qoshish.bat` (→ `agy3`), **uchinchi** Google akkaunt bilan kiring, `/quit`.
-4. Tray → **"Sozlamalarni qayta yuklash"** (yoki ⟳ tugmasi).
-
-Xuddi shuni dastur ichidan ham qilish mumkin: **`•••` → agy akkauntlar → "Yangi agy akkaunt qo'shish…"**.
-Kirilmagan akkaunt qatorida **"kirish kerak"** va **Kirish** tugmasi chiqadi — u to'g'ri papka bilan `agy` ni ochadi.
-
-Natijada `config.json` taxminan shunday bo'ladi (namuna: [`config.example.json`](config.example.json)):
-
-```json
-"agy": [
-  { "name": "agy",  "enabled": true },
-  { "name": "agy2", "home": "~/.agy-accounts/agy2", "enabled": true },
-  { "name": "agy3", "home": "~/.agy-accounts/agy3", "enabled": true }
-]
+```powershell
+agy-acc save gmail1     # agy'ga allaqachon kirgan bo'lsangiz (aks holda: agy-acc add gmail1)
+agy-acc add gmail2      # agy ochiladi → 2-gmail bilan kiring → /quit
+agy-acc add gmail3      # agy ochiladi → 3-gmail bilan kiring → /quit
+agy-acc list            # * = hozir faol
+agy-acc use gmail2      # terminaldagi agy endi gmail2 limitidan foydalanadi
 ```
 
-> **Agar 2- va 3-akkaunt baribir 1-akkauntni ko'rsatsa** — demak `agy` loginni boshqa joyda (masalan `%APPDATA%`) saqlayapti.
-> Unda akkauntga `env` qo'shing, masalan:
-> `{ "name": "agy2", "home": "~/.agy-accounts/agy2", "env": { "APPDATA": "~/.agy-accounts/agy2/AppData/Roaming", "LOCALAPPDATA": "~/.agy-accounts/agy2/AppData/Local" } }`
-> va **Kirish** ni qayta bosing.
+Tray dasturi 3 ala akkauntning limitini ko'rsatadi. **To'liq qo'llanma: [AGY_AKKAUNTLAR.md](AGY_AKKAUNTLAR.md).**
 
 ## Sozlamalar
 
@@ -66,7 +52,8 @@ Fayl: `C:\Users\<siz>\.config\usage-bar\config.json` (birinchi ishga tushishda a
 | `trayIcon` | `"number"` (halqa + raqam) yoki `"rings"` (ikki halqa: tashqi 5 soat, ichki hafta). |
 | `agyPath` | `agy` topilmasa, uning to'liq yo'li, masalan `"C:/Users/siz/AppData/Roaming/npm/agy.cmd"`. |
 | `claude[]` | `{ "name", "label"?, "configDir" }` — Claude Code config papkasi (`~/.claude`). `label: "reserve"` kartani xiraroq qiladi. |
-| `agy[]` | `{ "name", "home"?, "enabled", "env"? }` — yuqoriga qarang. |
+| `agy[]` | `{ "name", "enabled" }` — `agy-acc` o'zi qo'shadi. (`"home"` / `"env"` faqat Windows bo'lmagan tizimlar uchun.) |
+| `agyCredential` | agy loginining Credential Manager'dagi nomi (standart `gemini:antigravity`). |
 | `quotaFile` | Ixtiyoriy: tarmoq o'rniga shu JSON fayldan o'qish (asl README'dagi format). |
 
 **Claude Code** (bo'lsa): Windows'da token `C:\Users\<siz>\.claude\.credentials.json` da turadi — dastur shuni o'qiydi.
@@ -78,7 +65,9 @@ Bir nechta Claude akkaunt: `CLAUDE_CONFIG_DIR=C:\Users\siz\.claude-ish` bilan ki
 |---|---|
 | Ikonka chiqmadi | `check.bat` ni ishga tushiring — har bir akkaunt natijasi yoki xatosi chiqadi. `python usage_bar.py` (w siz) xatoni ko'rsatadi. |
 | `agy topilmadi` | `where agy` buyrug'i nima chiqarsa, o'shani `agyPath` ga yozing. |
-| agy qatori *kirish kerak* | **Kirish** → ochilgan oynada Google bilan kiring → `/quit`. |
+| agy qatori *kirish kerak* | **Kirish** (yoki `agy-acc login NOM`) → Google bilan kiring → `/quit`. |
+| *agy / Antigravity ochiq* | Ochiq turgan agy'ga tegilmasligi uchun boshqa akkauntlar u yopilgach yangilanadi. |
+| 3 ala akkaunt bir xil raqam | `agy-acc list` — har biriga turli email yozilganini tekshiring. |
 | `agy /quota javob bermadi` | `agy -p "/quota"` ni terminalda qo'lda tekshiring. |
 | "Claude login topilmadi" / "token eskirgan" | O'sha akkauntda Claude Code'ni bir marta oching (token yangilanadi). |
 | 429 | Anthropic cheklovi: dastur o'zi kutadi va oxirgi raqamlarni ko'rsatadi. |
