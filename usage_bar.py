@@ -2003,6 +2003,29 @@ class App:
     def visible(self):
         return self.win is not None and self.win.winfo_viewable()
 
+    def _no_taskbar_button(self):
+        """A tool window gets no taskbar button (otherwise a Python icon shows up there every time)."""
+        if not IS_WIN:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes as wt
+            u32 = ctypes.windll.user32
+            u32.GetAncestor.argtypes = [wt.HWND, wt.UINT]
+            u32.GetAncestor.restype = wt.HWND
+            get = getattr(u32, "GetWindowLongPtrW", u32.GetWindowLongW)
+            put = getattr(u32, "SetWindowLongPtrW", u32.SetWindowLongW)
+            get.argtypes, get.restype = [wt.HWND, ctypes.c_int], ctypes.c_ssize_t
+            put.argtypes, put.restype = [wt.HWND, ctypes.c_int, ctypes.c_ssize_t], ctypes.c_ssize_t
+            self.win.update_idletasks()
+            hwnd = u32.GetAncestor(self.win.winfo_id(), 2)   # GA_ROOT
+            ex = get(hwnd, -20)                                # GWL_EXSTYLE
+            new = (ex | 0x00000080) & ~0x00040000              # + WS_EX_TOOLWINDOW, - WS_EX_APPWINDOW
+            if new != ex:
+                put(hwnd, -20, new)
+        except Exception:
+            pass
+
     def _focus_out(self, _e):
         def check():
             if not self.menu_open and self.visible() and self.win.focus_get() is None:
@@ -2017,6 +2040,7 @@ class App:
             self.store.refresh()
         self.scroll = 0
         self.render()
+        self._no_taskbar_button()   # before the window is shown, so Windows never adds the button
         self.win.deiconify()
         self.win.lift()
         self.win.focus_force()
