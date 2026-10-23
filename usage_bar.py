@@ -551,7 +551,12 @@ class CrossProcessLock:
 
     def acquire(self, wait=True, notice=None, limit=300) -> bool:
         self._t.acquire()
+        self._depth = getattr(self, "_depth", 0)
+        if self._depth:   # this thread already holds it (e.g. "run" calls "use")
+            self._depth += 1
+            return True
         if not IS_WIN:
+            self._depth = 1
             return True
         k = self._kernel32()
         h = k.CreateMutexW(None, False, self.NAME)
@@ -576,9 +581,14 @@ class CrossProcessLock:
                 self._t.release()
                 raise TimeoutError("agy login band (boshqa jarayon ishlatyapti)")
         self._h = h
+        self._depth = 1
         return True
 
     def release(self):
+        self._depth -= 1
+        if self._depth:
+            self._t.release()
+            return
         if IS_WIN and self._h:
             k = self._kernel32()
             k.ReleaseMutex(self._h)
@@ -809,7 +819,9 @@ def fetch_agy_swapped(accounts: list[dict], priors: dict, agy_bin: str | None, c
     skipped while agy / Antigravity is open, so a running session is never disturbed."""
     out = {}
     acc = AgyAccounts(cfg)
-    with CRED_LOCK:
+    if not CRED_LOCK.acquire(wait=False):   # agy-acc run/use holds it: check again next round
+        return out
+    try:
         acc.recover()
         acc.sync_active()
         active = acc.matching(acc.current())
@@ -851,6 +863,8 @@ def fetch_agy_swapped(accounts: list[dict], priors: dict, agy_bin: str | None, c
                 r["email"] = acc.email(a["name"]) or r.get("outEmail") or r.get("email")
                 if r.get("outEmail") and not acc.email(a["name"]):
                     acc.set_email(a["name"], r["outEmail"])
+    finally:
+        CRED_LOCK.release()
     return out
 
 
@@ -872,17 +886,48 @@ agy-acc — bir nechta Google (gmail) akkauntni agy uchun boshqarish
   agy-acc save NOM          hozir agy'da kirilgan akkauntni NOM nomi bilan saqlash
   agy-acc add NOM           yangi gmail qo'shish: agy ochiladi, kirasiz, /quit — avtomatik saqlanadi
   agy-acc use NOM           agy (va Antigravity) uchun NOM akkauntiga o'tish
+  agy-acc open NOM          NOM ga o'tib, agy'ni ochish  (qisqasi: shunchaki  NOM  deb yozing, masalan  agy1)
   agy-acc login NOM         NOM akkauntiga qayta kirish (token eskirgan bo'lsa)
   agy-acc rename ESKI YANGI akkaunt nomini o'zgartirish
   agy-acc email NOM GMAIL   akkaunt qaysi gmail ekanini yozib qo'yish (ro'yxatda ko'rinmasa)
   agy-acc remove NOM        saqlangan akkauntni o'chirish
   agy-acc current           hozirgi akkaunt
+  agy-acc quota [--json]    har bir akkaunt limiti (% ishlatilgan)
+  agy-acc run "vazifa"      vazifani agy'ga berish: limiti ko'p qolgan gmail o'zi tanlanadi (batafsil: run --help)
   agy-acc doctor            muammoni aniqlash uchun loginlar tuzilishi (tokenlarsiz)
 
   --force                   agy ochiq bo'lsa ham bajarish (tavsiya etilmaydi)
 
 Eslatma: saqlangan akkaunt uchun agy ichida /logout QILMANG — token bekor bo'lib qolishi mumkin.
 """
+
+
+SHORTCUT_MARK = "rem usage-bar agy shortcut"
+APP_DIR = Path(os.path.abspath(__file__)).parent
+
+
+def sync_shortcuts() -> None:
+    """agy1.bat, agy2.bat… next to agy-acc.bat (that folder is on PATH): typing the account name opens agy with it."""
+    if not IS_WIN and not os.environ.get("USAGE_BAR_FAKE_CREDS"):
+        return
+    cfg, err = load_config()
+    if err:
+        return
+    names = {a["name"] for a in cfg["agy"] if is_swap_account(a) and re.fullmatch(r"[\w.-]{1,40}", a["name"])}
+    for f in APP_DIR.glob("*.bat"):   # drop shortcuts of removed / renamed accounts
+        try:
+            if SHORTCUT_MARK in f.read_text(encoding="utf-8", errors="ignore") and f.stem not in names:
+                f.unlink()
+        except OSError:
+            pass
+    for n in names:
+        f = APP_DIR / f"{n}.bat"
+        if n.lower() in ("agy", "agy-acc", "start", "check", "install") or (f.exists() and SHORTCUT_MARK not in f.read_text(encoding="utf-8", errors="ignore")):
+            continue   # never shadow agy itself or overwrite a file that isn't ours
+        try:
+            f.write_text(f"@echo off\r\n{SHORTCUT_MARK}\r\ncall \"%~dp0agy-acc.bat\" open {n} %*\r\n", encoding="utf-8")
+        except OSError:
+            pass
 
 
 def _ensure_config_account(name: str) -> None:
@@ -902,12 +947,202 @@ def _run_agy_interactive(cfg: dict) -> int:
     return subprocess.call([agy], cwd=tempfile.gettempdir())
 
 
+# ───────────────────────────── agy-acc quota / run (also used by the Claude Code skill) ─────────────────────────────
+
+EXHAUSTED_RX = re.compile(r"resource[_ ]exhausted|quota (?:exceeded|exhausted|reached)|out of quota|"
+                          r"usage limit|rate[- ]limit|limit (?:reached|exceeded)|\b429\b", re.I)
+GROUPS = {"gemini": "gemini", "claude": "claude", "gpt": "claude"}
+
+
+def _used(g: dict | None) -> float | None:
+    vals = [w["used"] for w in ((g or {}).get("five"), (g or {}).get("week")) if w]
+    return max(vals) if vals else None
+
+
+def agy_quota_rows(refresh: bool = False) -> list[dict]:
+    """Per-account agy quota (% used) from the tray's cache; checks again whatever is due (or all with refresh)."""
+    st = Store()
+    st.refresh(force=refresh, wait=True)
+    st.load()
+    active = AgyAccounts(st.config).active()
+
+    def win(w):
+        return None if not w else {"used": round(w["used"]), "resets": fmt_reset(w["resets"]) if w["resets"] else None}
+
+    rows = []
+    for a in st.view["agy"]:
+        rows.append({
+            "name": a["id"], "email": a.get("email"), "active": a["id"] == active, "enabled": a["enabled"],
+            "needsLogin": a["needsLogin"], "error": a["error"],
+            "gemini": {"five": win((a["gemini"] or {}).get("five")), "week": win((a["gemini"] or {}).get("week"))},
+            "claude": {"five": win((a["claude"] or {}).get("five")), "week": win((a["claude"] or {}).get("week"))},
+            "geminiUsed": _used(a["gemini"]), "claudeUsed": _used(a["claude"]),
+        })
+    return rows
+
+
+def cmd_quota(args: list[str]) -> int:
+    rows = agy_quota_rows(refresh="--refresh" in args)
+    if "--json" in args:
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+        return 0
+    if not rows:
+        print("agy akkaunt yo'q. Qo'shish: agy-acc add NOM")
+        return 1
+
+    def cell(w):
+        return "–" if not w else f"{w['used']}%"
+    print(f"   {'NOM':<8} {'GMAIL':<34} {'GEMINI 5s/hafta':<17} {'CLAUDE&GPT 5s/hafta':<20} HOLAT")
+    for r in rows:
+        state = ("o'chiq" if not r["enabled"] else "kirish kerak" if r["needsLogin"] else (r["error"] or "ok"))[:40]
+        g, c = r["gemini"], r["claude"]
+        print(f" {'*' if r['active'] else ' '} {r['name']:<8} {(r['email'] or '')[:34]:<34} "
+              f"{cell(g['five']) + ' / ' + cell(g['week']):<17} {cell(c['five']) + ' / ' + cell(c['week']):<20} {state}")
+    return 0
+
+
+def _run_streaming(cmd: list[str]) -> tuple[int, str]:
+    """Runs agy, passing its output through as it comes; returns (exit code, last lines)."""
+    from collections import deque
+    tail: deque = deque(maxlen=40)
+    p = subprocess.Popen(cmd, cwd=os.getcwd(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    for raw in iter(p.stdout.readline, b""):
+        line = raw.decode("utf-8", errors="replace")
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        tail.append(ANSI.sub("", line))
+    return p.wait(), "".join(tail)
+
+
+RUN_HELP = """\
+agy-acc run — vazifani agy'ga berish; limiti eng ko'p qolgan gmail o'zi tanlanadi
+
+  agy-acc run "savol yoki vazifa"
+  agy-acc run --group claude "..."     Claude & GPT limitiga qarab tanlash (standart: gemini)
+  agy-acc run --account agy2 "..."     aniq akkaunt bilan
+  agy-acc run --file prompt.txt        vazifani fayldan o'qish
+  agy-acc run --refresh "..."          avval hamma akkaunt limitini qayta tekshirish
+
+Limit tugagani ko'rinsa, keyingi akkaunt bilan qayta urinadi.
+"""
+
+
+def cmd_run(args: list[str]) -> int:
+    group, account, refresh, prompt_file, rest = "gemini", None, False, None, []
+    it = iter(args)
+    for x in it:
+        if x == "--group":
+            group = GROUPS.get(next(it, "").lower(), "")
+        elif x == "--account":
+            account = next(it, None)
+        elif x == "--file":
+            prompt_file = next(it, None)
+        elif x == "--refresh":
+            refresh = True
+        elif x in ("-h", "--help"):
+            print(RUN_HELP)
+            return 0
+        else:
+            rest.append(x)
+    if not group:
+        print("--group: gemini yoki claude")
+        return 2
+    prompt = Path(prompt_file).read_text(encoding="utf-8-sig") if prompt_file else " ".join(rest)
+    if not prompt.strip():
+        print(RUN_HELP)
+        return 2
+    cfg, _ = load_config()
+    agy = find_agy(cfg)
+    if not agy:
+        print("agy topilmadi. O'rnating yoki config.json'da \"agyPath\" ni yozing.")
+        return 2
+    if agy.lower().endswith((".cmd", ".bat")) and re.search(r'[&|<>^%"\r\n]', prompt):
+        print("agy .cmd orqali ishlayapti — vazifada & | < > ^ % \" yoki yangi qator bo'lmasin "
+              "(yoki config.json'da \"agyPath\" ni agy.exe ga yo'naltiring).")
+        return 2
+
+    rows = agy_quota_rows(refresh)
+    usable = [r for r in rows if r["enabled"] and not r["needsLogin"]]
+    if account:
+        order = [r for r in usable if r["name"].lower() == account.lower()]
+        if not order:
+            print(f"'{account}' ishlatib bo'lmaydi (yo'q, o'chiq yoki kirish kerak). Ro'yxat: agy-acc quota")
+            return 2
+    else:
+        key = group + "Used"
+        order = sorted((r for r in usable if (r[key] if r[key] is not None else 0) < 99.5),
+                       key=lambda r: (r[key] if r[key] is not None else 50, not r["active"]))
+    if not order:
+        print(f"Hamma akkauntlarda {group} limiti tugagan. Holat: agy-acc quota")
+        return 3
+
+    acc = AgyAccounts(cfg)
+    try:
+        CRED_LOCK.acquire(notice="Tray dasturi hozir agy kvotasini tekshiryapti — kutyapman…")
+    except TimeoutError as e:
+        print(e)
+        return 4
+    try:
+        running = agy_running()
+        tried = []
+        for r in order:
+            name = r["name"]
+            current = acc.matching(acc.current())
+            if name != current:
+                if running:   # an open agy/Antigravity holds the login: only the current account can be used
+                    if current and any(o["name"] == current for o in order) and current not in tried:
+                        name = current
+                    else:
+                        print("agy yoki Antigravity ilovasi ochiq, hozirgi akkauntni esa ishlatib bo'lmaydi. Ularni yoping va qayta urinib ko'ring.")
+                        return 4
+                elif cmd_acc(["use", name]) != 0:
+                    continue
+            tried.append(name)
+            sys.stdout.flush()
+            email = next((o["email"] for o in rows if o["name"] == name), None)
+            print(f"[agy-acc] {name}" + (f" ({email})" if email else "") + " bilan bajarilmoqda…", file=sys.stderr, flush=True)
+            rc, tail = _run_streaming([agy, "-p", prompt])
+            if rc != 0 and EXHAUSTED_RX.search(tail):
+                print(f"\n[agy-acc] {name} limiti tugadi — keyingi akkauntga o'tyapman.", file=sys.stderr, flush=True)
+                if running:
+                    break
+                continue
+            return rc
+        print(f"[agy-acc] Ishlatish mumkin bo'lgan akkaunt qolmadi ({', '.join(tried) or '—'}). Holat: agy-acc quota", file=sys.stderr)
+        return 3
+    finally:
+        CRED_LOCK.release()
+
+
 def cmd_acc(args: list[str]) -> int:
     force = "--force" in args
     args = [a for a in args if a != "--force"]
     if not args or args[0] in ("-h", "--help", "help"):
         print(ACC_HELP)
         return 0
+    if args[0] == "quota":
+        return cmd_quota(args[1:])
+    if args[0] == "run":
+        return cmd_run(args[1:])
+    if args[0] == "shortcuts":
+        sync_shortcuts()
+        print("Qisqa buyruqlar yangilandi: " + ", ".join(sorted(f.stem for f in APP_DIR.glob("*.bat")
+                                                            if SHORTCUT_MARK in f.read_text(encoding="utf-8", errors="ignore"))))
+        return 0
+    if args[0] == "open":   # switch, then open agy interactively (what the agy1/agy2 shortcuts run)
+        if len(args) < 2:
+            print("Ishlatish:  agy-acc open NOM")
+            return 1
+        rc = cmd_acc(["use", args[1]] + (["--force"] if force else []))
+        if rc != 0:
+            return rc
+        cfg, _ = load_config()
+        agy = find_agy(cfg)
+        if not agy:
+            print("agy topilmadi.")
+            return 1
+        sys.stdout.flush()
+        return subprocess.call([agy] + args[2:])
     cfg, _ = load_config()
     acc = AgyAccounts(cfg)
     if not acc.cs.available:
@@ -974,7 +1209,10 @@ def cmd_acc(args: list[str]) -> int:
         cur = acc.current()
         active = acc.matching(cur)
         names = acc.names()
-        return _acc_change(op, name, args, force, acc, cfg, cur, active, names)
+        rc = _acc_change(op, name, args, force, acc, cfg, cur, active, names)
+        if op in ("save", "add", "login", "rename", "remove"):
+            sync_shortcuts()
+        return rc
     finally:
         CRED_LOCK.release()
 
@@ -2368,6 +2606,21 @@ class App:
 
 # ───────────────────────────── entry point ─────────────────────────────
 
+def install_skill() -> int:
+    """Copies skills/agy/SKILL.md to ~/.claude/skills/agy/ with this folder's path filled in (Claude Code skill)."""
+    src = APP_DIR / "skills" / "agy" / "SKILL.md"
+    if not src.exists():
+        print(f"Topilmadi: {src}")
+        return 1
+    dest = HOME / ".claude" / "skills" / "agy" / "SKILL.md"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    app = str(Path(os.path.abspath(__file__))).replace("\\", "/")
+    dest.write_text(src.read_text(encoding="utf-8").replace("{{APP}}", app), encoding="utf-8")
+    print(f"Claude Code skill o'rnatildi: {dest}")
+    print("Claude Code'ni qayta oching va so'rang, masalan: \"agy bilan shu faylni review qildir\" yoki /agy")
+    return 0
+
+
 def cmd_check():
     s = Store()
     s.refresh(force=True, wait=True)
@@ -2386,9 +2639,17 @@ def cmd_check():
 
 
 def main(argv):
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream and not stream.isatty():
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     if "--check" in argv:
         cmd_check()
         return
+    if "--install-skill" in argv:
+        sys.exit(install_skill())
     if argv and argv[0] == "acc":
         sys.exit(cmd_acc(argv[1:]))
     if "--add-agy" in argv:

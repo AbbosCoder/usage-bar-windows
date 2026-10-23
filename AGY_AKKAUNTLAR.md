@@ -96,6 +96,9 @@ Qaysi akkauntda limit ko'proq qolganini tray ikonkasidagi oynadan ko'rasiz: unda
 
 | Buyruq | Nima qiladi |
 |---|---|
+| `agy1` (akkaunt nomi) yoki `agy-acc open agy1` | Shu akkauntga o'tib, `agy` ni ochadi |
+| `agy-acc quota` | Har bir akkaunt limiti (% ishlatilgan) |
+| `agy-acc run "vazifa"` | Vazifani agy'ga beradi: limiti ko'p qolgan gmail o'zi tanlanadi, limit tugasa keyingisiga o'tadi |
 | `agy-acc current` | Hozirgi faol akkaunt nomi |
 | `agy-acc login gmail2` | gmail2 ga qayta kirish (token eskirgan / "kirish kerak" chiqqan bo'lsa) |
 | `agy-acc rename agy gmail1` | Akkaunt nomini o'zgartirish (masalan tray o'zi `agy` deb saqlagan bo'lsa) |
@@ -114,3 +117,16 @@ Shularni tray dasturi ichidan ham qilsa bo'ladi: **`•••` → agy akkauntla
 - **Qo'lda boshqa gmail bilan kirsangiz,** `agy-acc` uni hech qaysi saqlangan akkaunt ustiga yozmaydi. `list` buyrug'i "saqlanmagan akkaunt bor" deydi; uni `agy-acc save gmail4` bilan saqlang.
 - **Saqlangan loginlarni ko'rish:** *Boshqaruv paneli → Credential Manager → Windows Credentials* → `usage-bar/agy/...`. U yerdan o'chirsa ham bo'ladi.
 - **Kelajakda `agy` boshqa joyda saqlay boshlasa** (masalan, yangi versiyada): `config.json` ga `"agyCredential": "<yangi nom>"` yozing.
+
+## Claude Code'dan agy'ni ishlatish (skill)
+
+`install.bat` (yoki `python usage_bar.py --install-skill`) Claude Code uchun **`agy`** skill'ini o'rnatadi:
+`C:\Users\<siz>\.claude\skills\agy\SKILL.md`. Claude Code'ni qayta ochgach, unga shunday deyish mumkin:
+
+- "agy bilan shu funksiyani review qildir"
+- "bu savolni Gemini'ga ber, Claude limitini tejaylik"
+- "agy akkauntlarimda qancha limit qoldi?"
+- yoki shunchaki `/agy ...`
+
+Claude `agy-acc run` orqali vazifani limiti eng ko'p qolgan gmail'ga beradi, javobni tekshirib sizga aytadi.
+Kirish (`add`, `login`) kabi brauzer kerak bo'lgan ishlarni Claude o'zi qilmaydi — ularni siz terminalda bajarasiz.

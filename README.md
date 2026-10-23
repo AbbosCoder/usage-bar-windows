@@ -39,7 +39,9 @@ agy-acc list            # * = hozir faol
 agy-acc use gmail2      # terminaldagi agy endi gmail2 limitidan foydalanadi
 ```
 
-Tray dasturi 3 ala akkauntning limitini ko'rsatadi. **To'liq qo'llanma: [AGY_AKKAUNTLAR.md](AGY_AKKAUNTLAR.md).**
+Tray dasturi 3 ala akkauntning limitini ko'rsatadi. Qisqa buyruqlar: `agy1`, `agy2`… (shu akkauntda agy'ni ochadi), `agy-acc quota`, `agy-acc run "vazifa"`.
+
+**Claude Code skill:** `install.bat` Claude Code uchun `agy` skill'ini ham o'rnatadi — Claude vazifalarni limiti ko'p qolgan Gemini akkauntiga bera oladi (batafsil: AGY_AKKAUNTLAR.md oxirida). **To'liq qo'llanma: [AGY_AKKAUNTLAR.md](AGY_AKKAUNTLAR.md).**
 
 ## Sozlamalar
 

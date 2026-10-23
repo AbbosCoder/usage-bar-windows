@@ -7,6 +7,8 @@ where py >nul 2>nul && (set PY=py -3) || (set PY=python)
 %PY% -m pip install --user -r requirements.txt || (echo pip xatosi. & pause & exit /b 1)
 rem agy-acc buyrug'i istalgan terminalda ishlashi uchun shu papkani foydalanuvchi PATH'iga qo'shamiz
 powershell -NoProfile -Command "$d='%~dp0'.TrimEnd('\'); $p=[Environment]::GetEnvironmentVariable('Path','User'); if (-not $p) {$p=''}; if (($p -split ';') -notcontains $d) { [Environment]::SetEnvironmentVariable('Path', ($p.TrimEnd(';') + ';' + $d).TrimStart(';'), 'User'); Write-Host 'PATH ga qo''shildi:' $d }"
+%PY% "%~dp0usage_bar.py" --install-skill
+%PY% "%~dp0usage_bar.py" acc shortcuts >nul 2>nul
 echo.
 echo O'rnatildi. Ishga tushirilmoqda...
 call "%~dp0start.bat"
