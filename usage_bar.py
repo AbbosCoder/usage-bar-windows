@@ -295,6 +295,7 @@ def fetch_claude(acct: dict, prior: dict | None) -> dict:
 
 # ───────────────────────────── agy ─────────────────────────────
 
+EMAIL_RX = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
 PCT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 ISO = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?")
@@ -385,6 +386,9 @@ def fetch_agy(acct: dict, prior: dict | None, agy_bin: str | None) -> dict:
     gem, cla = parse_agy(out)
     if gem or cla:
         rec.update(gemini=gem, claude=cla, fetchedAt=rec["lastAttempt"], needsLogin=False, error=None)
+        m = EMAIL_RX.search(ANSI.sub("", out))
+        if m:
+            rec["outEmail"] = m.group(0)
         return rec
     low = out.lower()
     if any(k in low for k in ("authentication", "not signed in", "sign in", "not logged in", "log in", "login")):
@@ -694,15 +698,40 @@ class AgyAccounts:
         self.cs = CredStore()
 
     # state: which saved account is currently in the shared credential
-    def active(self) -> str | None:
+    @staticmethod
+    def _state() -> dict:
         try:
-            return json.loads(STATE_PATH.read_text(encoding="utf-8")).get("active")
+            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
         except Exception:
-            return None
+            return {}
+
+    @staticmethod
+    def _save_state(st: dict) -> None:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STATE_PATH.write_text(json.dumps(st, indent=1), encoding="utf-8")
+
+    def active(self) -> str | None:
+        return self._state().get("active")
 
     def set_active(self, name: str | None) -> None:
-        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        STATE_PATH.write_text(json.dumps({"active": name}), encoding="utf-8")
+        st = self._state()
+        st["active"] = name
+        self._save_state(st)
+
+    def set_email(self, name: str, email: str | None) -> None:
+        """The gmail of an account, for logins that don't carry it (typed by the user or seen in agy output)."""
+        st = self._state()
+        emails = st.setdefault("emails", {})
+        if email:
+            emails[name] = email
+        else:
+            emails.pop(name, None)
+        self._save_state(st)
+
+    def email(self, name: str, slot: dict | None = None) -> str | None:
+        if slot is None:
+            slot = self.cs.read(SLOT_PREFIX + name)
+        return cred_identity(slot) or self._state().get("emails", {}).get(name)
 
     def has(self, name: str) -> bool:
         return self.cs.read(SLOT_PREFIX + name) is not None
@@ -816,6 +845,12 @@ def fetch_agy_swapped(accounts: list[dict], priors: dict, agy_bin: str | None, c
                 out[n.lower()] = fetch_agy(a, prior, agy_bin)
             finally:
                 acc.swap_out(n, prev)
+        for a in accounts:   # which gmail each account is, for the popover
+            r = out.get(a["name"].lower())
+            if r is not None:
+                r["email"] = acc.email(a["name"]) or r.get("outEmail") or r.get("email")
+                if r.get("outEmail") and not acc.email(a["name"]):
+                    acc.set_email(a["name"], r["outEmail"])
     return out
 
 
@@ -839,6 +874,7 @@ agy-acc — bir nechta Google (gmail) akkauntni agy uchun boshqarish
   agy-acc use NOM           agy (va Antigravity) uchun NOM akkauntiga o'tish
   agy-acc login NOM         NOM akkauntiga qayta kirish (token eskirgan bo'lsa)
   agy-acc rename ESKI YANGI akkaunt nomini o'zgartirish
+  agy-acc email NOM GMAIL   akkaunt qaysi gmail ekanini yozib qo'yish (ro'yxatda ko'rinmasa)
   agy-acc remove NOM        saqlangan akkauntni o'chirish
   agy-acc current           hozirgi akkaunt
   agy-acc doctor            muammoni aniqlash uchun loginlar tuzilishi (tokenlarsiz)
@@ -878,7 +914,7 @@ def cmd_acc(args: list[str]) -> int:
         print("Bu buyruq faqat Windows uchun (agy logini Credential Manager'da).")
         return 1
     op, name = args[0], (args[1] if len(args) > 1 else None)
-    if op in ("save", "add", "use", "login", "remove", "rename") and not name:
+    if op in ("save", "add", "use", "login", "remove", "rename", "email") and not name:
         print(f"Nom kerak:  agy-acc {op} NOM")
         return 1
     if name and not re.fullmatch(r"[\w.@+-]{1,40}", name):
@@ -889,7 +925,8 @@ def cmd_acc(args: list[str]) -> int:
         print(f"agy:        {find_agy(cfg) or 'TOPILMADI'}")
         print(f"faol login: {acc.target} → {describe_cred(acc.current())}")
         for n in acc.names():
-            print(f"{n:<11} → {describe_cred(acc.cs.read(SLOT_PREFIX + n))}")
+            print(f"{n:<11} → {describe_cred(acc.cs.read(SLOT_PREFIX + n))}"
+                  + (f" · yozilgan email: {acc.email(n)}" if acc.email(n) else ""))
         seen = set()
         print("\nCredential Manager'dagi tegishli yozuvlar:")
         for pat in ("*gemini*", "*antigravity*", "*agy*", "*google*"):
@@ -919,7 +956,7 @@ def cmd_acc(args: list[str]) -> int:
             for n in names:
                 mark = "*" if n == who else " "
                 slot = acc.cs.read(SLOT_PREFIX + n)
-                email = cred_identity(slot)
+                email = acc.email(n, slot)
                 print(f" {mark} {n:<12}" + (f" {email}" if email else "")
                       + ("" if slot else "   (login saqlanmagan — agy-acc login " + n + ")"))
             if cur and not who:
@@ -977,6 +1014,10 @@ def _acc_change(op, name, args, force, acc, cfg, cur, active, names) -> int:
             acc.cs.delete(SLOT_PREFIX + name)
             if acc.active() == name:
                 acc.set_active(new)
+            old_mail = acc._state().get("emails", {}).get(name)
+            if old_mail:
+                acc.set_email(new, old_mail)
+                acc.set_email(name, None)
             cfg2, err = load_config()
             if not err:
                 for a in cfg2["agy"]:
@@ -988,7 +1029,20 @@ def _acc_change(op, name, args, force, acc, cfg, cur, active, names) -> int:
             print(f"'{name}' → '{new}' qilib o'zgartirildi.")
             return 0
 
+        if op == "email":
+            mail = args[2] if len(args) > 2 else ""
+            if not acc.has(name):
+                print(f"'{name}' saqlanmagan. Ro'yxat: agy-acc list")
+                return 1
+            if not EMAIL_RX.fullmatch(mail):
+                print("Ishlatish:  agy-acc email NOM siz@gmail.com")
+                return 1
+            acc.set_email(name, mail)
+            print(f"{name} → {mail}")
+            return 0
+
         if op == "remove":
+            acc.set_email(name, None)
             acc.cs.delete(SLOT_PREFIX + name)
             if active == name:
                 acc.set_active(None)
@@ -1042,6 +1096,14 @@ def _acc_change(op, name, args, force, acc, cfg, cur, active, names) -> int:
             acc.set_active(name)
             _ensure_config_account(name)
             email = cred_identity(new)
+            if not email:
+                try:
+                    typed = input("\nQaysi gmail bilan kirdingiz? (agy bannerida ko'ringan; Enter — o'tkazib yuborish): ").strip()
+                except EOFError:
+                    typed = ""
+                if EMAIL_RX.fullmatch(typed):
+                    acc.set_email(name, typed)
+                    email = typed
             print(f"\nSaqlandi: {name}" + (f" ({email})" if email else "") + " — hozir faol." + (f"  Avvalgisiga qaytish: agy-acc use {prev_name}" if prev_name and prev_name != name else ""))
             return 0
 
@@ -1139,10 +1201,12 @@ class Store:
                            "five": live(rec.get("five")), "week": live(rec.get("week")), "error": rec.get("error"),
                            "stale": bool(rec.get("error") and rec.get("five"))})
         agy = []
+        typed_emails = AgyAccounts._state().get("emails", {})
         for a in cfg["agy"]:
             rec = arecs.get(a["name"].lower()) or {}
             agy.append({"id": a["name"], "enabled": a["enabled"], "needsLogin": bool(rec.get("needsLogin")),
                         "gemini": grp(rec.get("gemini")), "claude": grp(rec.get("claude")), "error": rec.get("error"),
+                        "email": typed_emails.get(a["name"]) or rec.get("email"),
                         "fetched": bool(rec.get("fetchedAt"))})
 
         mb = next((c for c in claude if c["id"].lower() == (cfg.get("menuBarAccount") or "").lower()), claude[0] if claude else None)
@@ -1858,7 +1922,14 @@ class Painter:
                     on = a["enabled"]
                     self.chevron(x0 + s(10), cy - s(8), s(16), is_open, P["fg2"] if on else P["fg3"])
                     self.text((x0 + s(30), cy), a["id"].upper(), fname, P["fg"] if on else P["fg3"], "lm")
-                    regions.append(((x0, top, x1, cy + s(18)), ("toggle", a["id"]), hid))
+                    email = a.get("email")
+                    if email:   # which gmail this account is
+                        fe = self.f(11.5)
+                        while len(email) > 4 and self.tw(email, fe) > x1 - x0 - s(44):
+                            email = email[:-2] + "…" if not email.endswith("…") else email[:-3] + "…"
+                        self.text((x0 + s(30), cy + s(17)), email, fe, P["fg3"], "lm")
+                        y += s(16)
+                    regions.append(((x0, top, x1, cy + s(18) + (s(16) if email else 0)), ("toggle", a["id"]), hid))
                     if not on:
                         self.text((x1 - s(14), cy), "o'chiq", self.f(12), P["fg3"], "rm")
                         y += s(22)
