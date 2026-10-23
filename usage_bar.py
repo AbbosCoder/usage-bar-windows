@@ -499,6 +499,26 @@ class CredStore:
         elif IS_WIN:
             self._adv.CredDeleteW(target, 1, 0)
 
+    def enumerate(self, pattern: str) -> list[tuple[str, int, str | None]]:
+        """(target, blob size, user) of credentials whose name matches e.g. "*gemini*". No secrets."""
+        if self.fake:
+            pat = pattern.strip("*").lower()
+            return [(k, len(v["blob"]), v.get("user")) for k, v in self._fake_all().items() if pat in k.lower()]
+        if not IS_WIN:
+            return []
+        ct = self._ct
+        from ctypes import wintypes as wt
+        PPC = ct.POINTER(self._PC)
+        self._adv.CredEnumerateW.argtypes = [wt.LPCWSTR, wt.DWORD, ct.POINTER(wt.DWORD), ct.POINTER(PPC)]
+        self._adv.CredEnumerateW.restype = wt.BOOL
+        n, arr = wt.DWORD(), PPC()
+        if not self._adv.CredEnumerateW(pattern, 0, ct.byref(n), ct.byref(arr)):
+            return []
+        try:
+            return [(arr[i].contents.TargetName, arr[i].contents.CredentialBlobSize, arr[i].contents.UserName) for i in range(n.value)]
+        finally:
+            self._adv.CredFree(arr)
+
 
 class CrossProcessLock:
     """Only one process at a time may swap the agy login (the tray app and the agy-acc command).
@@ -576,15 +596,71 @@ CRED_LOCK = CrossProcessLock()
 JWT = re.compile(r"eyJ[\w-]+\.(eyJ[\w-]+)\.[\w-]*")
 
 
+def _blob_texts(b: bytes) -> list[str]:
+    """Readable forms of a saved login: plain, UTF-16, go-keyring base64/hex wrappers, bare base64."""
+    import base64
+    import binascii
+    texts = [b.decode("utf-8", "ignore")]
+    if b.count(b"\0") > len(b) // 4:
+        texts.append(b.decode("utf-16-le", "ignore"))
+    for t in list(texts):
+        t = t.strip().strip("\0")
+        for pre, dec in (("go-keyring-base64:", base64.b64decode), ("go-keyring-encoded:", binascii.unhexlify)):
+            if t.startswith(pre):
+                try:
+                    texts.append(dec(t[len(pre):]).decode("utf-8", "ignore"))
+                except Exception:
+                    pass
+        if re.fullmatch(r"[A-Za-z0-9+/=_-]{40,}", t):
+            try:
+                texts.append(base64.b64decode(t + "=" * (-len(t) % 4), altchars=b"-_" if "-" in t or "_" in t else None)
+                             .decode("utf-8", "ignore"))
+            except Exception:
+                pass
+    return texts
+
+
+def describe_cred(cred: dict | None) -> str:
+    """Shape of a saved login for troubleshooting: size, encoding, JSON key names, token kinds. Never values."""
+    if cred is None:
+        return "yo'q"
+    b = cred.get("blob") or b""
+    utf16 = b.count(b"\0") > len(b) // 4
+    texts = _blob_texts(b)
+    t = texts[-1]
+    parts = [f"{len(b)} bayt", "utf-16" if utf16 else "utf-8"]
+    m = re.match(r"\s*(go-keyring-[a-z0-9]+:)", texts[1 if utf16 else 0])
+    if m:
+        parts.append(m.group(1))
+    elif len(texts) > (2 if utf16 else 1):
+        parts.append("base64")
+    try:
+        j = json.loads(t)
+        def keys(o, pre=""):
+            out = []
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    out.append(pre + k)
+                    out += keys(v, pre + k + ".")
+            return out
+        parts.append("json kalitlari: " + ", ".join(keys(j)[:25]))
+    except Exception:
+        parts.append("json emas")
+    parts.append(f"JWT: {len(JWT.findall(t))}")
+    for label, rx in (("ya29 access", r"ya29\.[\w-]+"), ("1// refresh", r"1//[\w-]+")):
+        if re.search(rx, t):
+            parts.append(label)
+    ident = cred_identity(cred)
+    parts.append(f"email: {ident or 'topilmadi'}")
+    return " · ".join(parts)
+
+
 def cred_identity(cred: dict | None) -> str | None:
     """Google account e-mail (or subject) from the id_token inside agy's saved login, if it can be read."""
     if not cred or not cred.get("blob"):
         return None
     import base64
-    b = cred["blob"]
-    texts = [b.decode("utf-8", "ignore")]
-    if b.count(b"\0") > len(b) // 4:
-        texts.append(b.decode("utf-16-le", "ignore"))
+    texts = _blob_texts(cred["blob"])
     for t in texts:
         for m in JWT.finditer(t):
             seg = m.group(1)
@@ -765,6 +841,7 @@ agy-acc — bir nechta Google (gmail) akkauntni agy uchun boshqarish
   agy-acc rename ESKI YANGI akkaunt nomini o'zgartirish
   agy-acc remove NOM        saqlangan akkauntni o'chirish
   agy-acc current           hozirgi akkaunt
+  agy-acc doctor            muammoni aniqlash uchun loginlar tuzilishi (tokenlarsiz)
 
   --force                   agy ochiq bo'lsa ham bajarish (tavsiya etilmaydi)
 
@@ -807,6 +884,20 @@ def cmd_acc(args: list[str]) -> int:
     if name and not re.fullmatch(r"[\w.@+-]{1,40}", name):
         print("Nom faqat harf, raqam va . _ - @ + belgilaridan iborat bo'lsin.")
         return 1
+
+    if op == "doctor":
+        print(f"agy:        {find_agy(cfg) or 'TOPILMADI'}")
+        print(f"faol login: {acc.target} → {describe_cred(acc.current())}")
+        for n in acc.names():
+            print(f"{n:<11} → {describe_cred(acc.cs.read(SLOT_PREFIX + n))}")
+        seen = set()
+        print("\nCredential Manager'dagi tegishli yozuvlar:")
+        for pat in ("*gemini*", "*antigravity*", "*agy*", "*google*"):
+            for tgt, size, user in acc.cs.enumerate(pat):
+                if tgt not in seen:
+                    seen.add(tgt)
+                    print(f"  {tgt}  ({size} bayt, user={user})")
+        return 0
 
     if op in ("list", "current"):   # read-only: never wait for the tray
         if CRED_LOCK.acquire(wait=False):
