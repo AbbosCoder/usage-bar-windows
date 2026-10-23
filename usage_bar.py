@@ -296,7 +296,7 @@ def fetch_claude(acct: dict, prior: dict | None) -> dict:
 # ───────────────────────────── agy ─────────────────────────────
 
 EMAIL_RX = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
-ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x1b\x07]*(?:\x07|\x1b\\)")
 PCT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 ISO = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?")
 
@@ -309,24 +309,29 @@ def parse_agy(text: str) -> tuple[dict | None, dict | None]:
         cols = [c.strip() for c in re.split(r"\t|\s{2,}|[│|]", line) if c.strip()]
         if len(cols) < 3:
             continue
-        head = (cols[0] + " " + cols[1]).lower()
-        if "gemini" in head:
-            g = "gemini"
-        elif "claude" in head or "gpt" in head:
-            g = "claude"
-        else:
+        g = None
+        for c in (cols[0].lower(), cols[1].lower()):   # group column first, so "Gemini" in a Claude label doesn't win
+            if "gemini" in c:
+                g = "gemini"
+            elif "claude" in c or "gpt" in c:
+                g = "claude"
+            if g:
+                break
+        if not g:
             continue
-        m = PCT.search(" ".join(cols[1:]))
-        if not m:
+        # the value is the right-most % column; a % inside the label must not be taken
+        pi = next((i for i in range(len(cols) - 1, 0, -1) if PCT.search(cols[i])), None)
+        if pi is None:
             continue
-        label = " ".join(c for c in cols[:3] if "%" not in c and not ISO.search(c)).lower()
+        m = PCT.search(cols[pi])
+        label = " ".join(cols[:pi]).lower()
         if re.search(r"week|7[- ]?day", label):
             win = "week"
         elif re.search(r"five|5[- ]?h|5[- ]?hour|5[- ]?soat", label):
             win = "five"
         else:
             continue
-        iso = ISO.search(line)
+        iso = ISO.search(" ".join(cols[pi:]))   # reset time follows the value, never a date in the label
         rem = float(m.group(1))
         groups[g][win] = {"used": min(max(100 - rem, 0), 100), "resets": parse_iso(iso.group(0)) if iso else None}
     return groups["gemini"] or None, groups["claude"] or None
