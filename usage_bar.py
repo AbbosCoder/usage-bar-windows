@@ -33,6 +33,9 @@ IS_WIN = sys.platform == "win32"
 HOME = Path.home()
 APP_NAME = "UsageBar"
 USAGE_URL = os.environ.get("USAGE_BAR_API") or "https://api.anthropic.com/api/oauth/usage"
+# Claude Code's public OAuth client: the same refresh the claude CLI does when its token runs out
+TOKEN_URLS = ("https://console.anthropic.com/v1/oauth/token", "https://platform.claude.com/v1/oauth/token")
+CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 AGY_ACCOUNTS_DIR = HOME / ".agy-accounts"
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_CONSOLE = 0x00000010
@@ -235,9 +238,61 @@ def claude_token(acct: dict) -> tuple[str, str | None]:
     if not tok:
         return "missing", None
     exp = o.get("expiresAt")
-    if isinstance(exp, (int, float)) and exp / 1000 < time.time():
-        return "expired", None
+    if isinstance(exp, (int, float)) and exp / 1000 < time.time() + 60:
+        # the Claude desktop app doesn't keep this file fresh, so renew it the way the claude CLI would
+        tok = refresh_claude_token(f)
+        return ("ok", tok) if tok else ("expired", None)
     return "ok", tok
+
+
+_REFRESH_LOCK = threading.Lock()
+
+
+def refresh_claude_token(f: Path) -> str | None:
+    """Swaps the refresh token in <configDir>/.credentials.json for a new access token and writes both back
+    (the old refresh token stops working, so the file must keep the new one for Claude Code). None on failure."""
+    with _REFRESH_LOCK:
+        try:
+            j = json.loads(f.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return None
+        o = j.get("claudeAiOauth") if "claudeAiOauth" in j else j
+        exp = o.get("expiresAt")
+        if isinstance(exp, (int, float)) and exp / 1000 >= time.time() + 60 and o.get("accessToken"):
+            return o["accessToken"]   # someone (the CLI, another thread) refreshed it meanwhile
+        rt = o.get("refreshToken")
+        if not rt:
+            return None
+        body = json.dumps({"grant_type": "refresh_token", "refresh_token": rt, "client_id": CLAUDE_CLIENT_ID}).encode()
+        r = None
+        for url in TOKEN_URLS:
+            req = urllib.request.Request(url, data=body, method="POST", headers={
+                "Content-Type": "application/json", "User-Agent": "usage-bar-windows"})
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    r = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as e:
+                if e.code != 404:   # 400/401 = the refresh token itself was refused: don't try it elsewhere
+                    return None
+            except Exception:
+                return None
+        if not r or not r.get("access_token"):
+            return None
+        o["accessToken"] = r["access_token"]
+        if r.get("refresh_token"):
+            o["refreshToken"] = r["refresh_token"]
+        if r.get("expires_in"):
+            o["expiresAt"] = int((time.time() + float(r["expires_in"])) * 1000)
+        if r.get("scope"):
+            o["scopes"] = r["scope"].split()
+        tmp = f.with_name(f.name + ".tmp")
+        try:   # write-then-replace so Claude Code never reads a half-written file
+            tmp.write_text(json.dumps(j), encoding="utf-8")
+            os.replace(tmp, f)
+        except OSError:
+            return None
+        return o["accessToken"]
 
 
 def _window(d) -> dict | None:
@@ -277,7 +332,7 @@ def fetch_claude(acct: dict, prior: dict | None) -> dict:
         rec["error"] = "Claude login topilmadi. Menyu → Claude akkauntlar → Kirish."
         return rec
     if state == "expired":
-        rec["error"] = "Claude tokeni eskirgan. Shu akkauntda Claude Code'ni bir marta oching."
+        rec["error"] = "Claude tokeni eskirgan va yangilanmadi. Terminalda claude → /login qiling."
         return rec
     rec["lastAPICall"] = now
     kind, val = call_usage_api(tok)

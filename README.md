@@ -114,7 +114,7 @@ $env:CLAUDE_CONFIG_DIR = "$env:USERPROFILE\.claude-ish"; claude
 | "hozirgi login hech qayerda saqlanmagan" | agy tokenni o'zi yangilagan: `agy-acc save NOM` bilan shu akkaunt ustiga qayta saqlang. |
 | Hamma akkaunt bir xil raqam | `agy-acc list` — har biriga turli email yozilganini tekshiring; `agy-acc doctor`. |
 | `agy /quota javob bermadi` | `agy -p "/quota"` ni terminalda qo'lda tekshiring. |
-| "Claude login topilmadi" / "token eskirgan" | O'sha akkauntda Claude Code'ni bir marta oching (token yangilanadi). |
+| "Claude login topilmadi" / "token eskirgan" | Dastur tokenni `.credentials.json` dagi refresh token bilan o'zi yangilaydi. Bu ham rad etilsa (masalan faqat Claude desktop ilovasidan foydalansangiz), terminalda `claude` → `/login` qiling. |
 | 429 | Anthropic cheklovi: dastur o'zi kutadi va oxirgi raqamlarni ko'rsatadi. |
 
 ## Maxfiylik
