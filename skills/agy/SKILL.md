@@ -39,7 +39,7 @@ python "{{APP}}" acc run --read-only --include src/a.py:120-180 "PROMPT"   # ans
 - `run` picks the account with the most quota left, switches agy to it, streams agy's answer to stdout and moves to the next account if a quota runs out. A line on stderr says which account was used (`[agy-acc] agy2 (…@gmail.com) …`).
 - agy can take minutes: give the Bash call a long timeout (up to 600000 ms) or run it in the background.
 
-Exit codes: `0` done · `2` bad usage / agy not found · `3` every account is out of quota (show the user `acc quota`, including reset times, and do the work yourself) · `4` agy or the Antigravity app is open and the current account can't be used — ask the user to close them (`/quit`).
+Exit codes: `0` done · `2` bad usage / agy not found · `3` every account is out of quota (show the user `acc quota`, including reset times, and do the work yourself) · `4` agy or the Antigravity app is open and the current account can't be used — ask the user to close them (`/quit`) · `5` no internet — agy was not started (offline it would open a Google sign-in page); do the work yourself or retry later.
 
 ## 3. How to use agy as a subagent
 

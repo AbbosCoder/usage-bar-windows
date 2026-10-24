@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -375,6 +376,16 @@ def run_capture(args: list[str], env: dict, timeout: float) -> tuple[str, bool, 
         except subprocess.TimeoutExpired:
             out = b""
     return (out or b"").decode("utf-8", errors="replace"), timed_out, None
+
+
+def internet_up(timeout: float = 3) -> bool:
+    """Can we reach Google's token endpoint? Offline, agy can't refresh its token and opens a sign-in page in the
+    browser (e.g. right after Windows starts, before Wi-Fi is up), so nothing is checked until this is true."""
+    try:
+        socket.create_connection(("oauth2.googleapis.com", 443), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
 
 
 def fetch_agy(acct: dict, prior: dict | None, agy_bin: str | None) -> dict:
@@ -1138,6 +1149,9 @@ def cmd_run(args: list[str]) -> int:
               "(yoki config.json'da \"agyPath\" ni agy.exe ga yo'naltiring).")
         return 2
 
+    if not internet_up():   # offline agy can't refresh its token and opens a Google sign-in page instead
+        print("Internet yo'q — agy ishga tushirilmadi. Ulanishni tekshirib, qayta urinib ko'ring.")
+        return 5
     started = time.time()
     rows = agy_quota_rows(refresh, max_age=30 * 60)   # the tray keeps these fresh; a stale pick is fixed by the fallback
     usable = [r for r in rows if r["enabled"] and not r["needsLogin"]]
@@ -1483,6 +1497,7 @@ class Store:
         self._mtime = self.config_mtime()
         self.refreshing = False
         self.view: dict = {}
+        self.offline = False
         self.load()
 
     def _saved_email(self, a: dict) -> str | None:
@@ -1503,7 +1518,7 @@ class Store:
             crecs, arecs = dict(self.cache["claude"]), dict(self.cache["agy"])
         names = [c["name"] for c in cfg["claude"]]
         updated = None
-        problem = self.problem
+        problem = self.problem or ("Internet yo'q — ulanish tiklangach yangilanadi" if self.offline else None)
         qf = (cfg.get("quotaFile") or "").strip()
         if qf:
             r = read_quota_file(qf)
@@ -1611,6 +1626,9 @@ class Store:
 
         def work():
             try:
+                self.offline = not internet_up()
+                if self.offline:   # nothing is marked as attempted, so the next tick (1 min) tries again
+                    return
                 with ThreadPoolExecutor(max_workers=6) as ex:
                     fc = {a["name"].lower(): ex.submit(fetch_claude, a, prior_c.get(a["name"].lower())) for a in cj}
                     fa = {a["name"].lower(): ex.submit(fetch_agy, a, prior_a.get(a["name"].lower()), agy_bin)
